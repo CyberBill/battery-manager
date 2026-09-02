@@ -12,8 +12,10 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 try:
     import serial.tools.list_ports as list_ports
@@ -128,6 +130,16 @@ def parse_discover_output(output: str) -> list[int]:
     return ordered
 
 
+def bitmask_to_ids(bitmask: int, max_ids: int = 32) -> list[int]:
+    """Convert a 32-bit unsigned bitmask to the list of BMS IDs represented by the set bits."""
+    bitmask &= 0xFFFFFFFF
+    ids: list[int] = []
+    for bms_id in range(1, max_ids + 1):
+        if bitmask & (1 << (bms_id - 1)):
+            ids.append(bms_id)
+    return ids
+
+
 def _stream_subprocess_output(
     process: subprocess.Popen[str],
     logger: logging.Logger,
@@ -235,6 +247,149 @@ def discover_all_ports(
     return discovered_by_port
 
 
+@dataclass
+class PortMonitor:
+    port: str
+    bitmask: int = DEFAULT_DISCOVER_MASK
+    timeout: int = 60
+    interval: int = 15
+    logger: logging.Logger = field(default_factory=lambda: logging.getLogger("battery_manager"))
+    discovered: list[int] = field(default_factory=list)
+    error: str | None = None
+    last_scan: float | None = None
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    on_update: Callable[[], None] | None = None
+
+    def start(self) -> None:
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self.run, name=f"port-monitor:{self.port}", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=2)
+
+    def restart(self) -> None:
+        self.stop()
+        self.start()
+
+    def scan_once(self) -> list[int]:
+        self.error = None
+        try:
+            found = run_discovery_for_port(self.port, bitmask=self.bitmask, timeout=self.timeout, logger=self.logger)
+            self.discovered = found
+            self.last_scan = time.time()
+            return found
+        except Exception as exc:  # pragma: no cover - runtime hardware dependent path.
+            self.error = str(exc)
+            self.discovered = []
+            self.logger.error("%s: discovery monitor error (%s)", self.port, exc)
+            return []
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            self.scan_once()
+            if self.on_update is not None:
+                self.on_update()
+            self.stop_event.wait(self.interval)
+
+    def status_line(self, port_width: int, status_width: int) -> str:
+        if self.discovered:
+            bms_text = ", ".join(str(item) for item in self.discovered)
+            state = f"BMS: {bms_text}"
+        else:
+            state = "BMS: none"
+
+        if self.error:
+            state = f"ERROR: {self.error}"
+
+        last_text = "never"
+        if self.last_scan is not None:
+            last_text = time.strftime("%H:%M:%S", time.localtime(self.last_scan))
+
+        return f"{self.port:<{port_width}}  {state:<{status_width}}  {last_text}"
+
+    def status_summary(self) -> str:
+        if self.discovered:
+            return f"BMS: {', '.join(str(item) for item in self.discovered)}"
+        if self.error:
+            return f"ERROR: {self.error}"
+        return "BMS: none"
+
+
+class PortRegistry:
+    def __init__(self, logger: logging.Logger | None = None):
+        self.logger = logger or logging.getLogger("battery_manager")
+        self.monitors: dict[str, PortMonitor] = {}
+
+    def add_port(self, port: str, bitmask: int = DEFAULT_DISCOVER_MASK, timeout: int = 60, interval: int = 15) -> PortMonitor:
+        if port not in self.monitors:
+            monitor = PortMonitor(port=port, bitmask=bitmask, timeout=timeout, interval=interval, logger=self.logger)
+            self.monitors[port] = monitor
+        return self.monitors[port]
+
+    def start_all(self) -> None:
+        for monitor in self.monitors.values():
+            monitor.start()
+
+    def stop_all(self) -> None:
+        for monitor in self.monitors.values():
+            monitor.stop()
+
+    def snapshot(self) -> dict[str, list[int]]:
+        return {port: monitor.discovered for port, monitor in sorted(self.monitors.items())}
+
+    def render_dashboard(self) -> str:
+        if not self.monitors:
+            return "\n".join([
+                "Daly BMS Manager",
+                "=" * 96,
+                "No ports configured.",
+            ])
+
+        port_width = max(20, max(len(port) for port in self.monitors) + 2)
+        status_texts = [monitor.status_summary() for monitor in self.monitors.values()]
+        status_width = max(28, max(len(text) for text in status_texts) + 2)
+
+        lines = [
+            "Daly BMS Manager",
+            "=" * 96,
+            f"{'Port':<{port_width}}  {'Status':<{status_width}}  {'Last Scan'}",
+            "-" * 96,
+        ]
+
+        for port in sorted(self.monitors):
+            monitor = self.monitors[port]
+            last_text = "never"
+            if monitor.last_scan is not None:
+                last_text = time.strftime("%H:%M:%S", time.localtime(monitor.last_scan))
+            lines.append(f"{monitor.port:<{port_width}}  {monitor.status_summary():<{status_width}}  {last_text}")
+
+        expected_ids = sorted({bms_id for monitor in self.monitors.values() for bms_id in bitmask_to_ids(monitor.bitmask)})
+        discovered_ids = sorted({item for monitor in self.monitors.values() for item in monitor.discovered})
+        missing_ids = [bms_id for bms_id in expected_ids if bms_id not in discovered_ids]
+
+        lines.append("-" * 96)
+        lines.append(f"Missing BMSs: {', '.join(str(item) for item in missing_ids) if missing_ids else 'none'}")
+        return "\n".join(lines)
+
+
+def run_dashboard(registry: PortRegistry, refresh_seconds: float = 1.0) -> None:
+    """Display a persistent text dashboard that redraws in place instead of scrolling endlessly."""
+    if not registry.monitors:
+        print("No ports configured.")
+        return
+
+    while True:
+        print("\033[H\033[J", end="")
+        print(registry.render_dashboard())
+        time.sleep(refresh_seconds)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Discover Daly BMS devices on all serial ports.")
     parser.add_argument(
@@ -259,6 +414,17 @@ def main() -> int:
         action="store_true",
         help="Print progress logs while each port is being scanned.",
     )
+    parser.add_argument(
+        "--scan-interval",
+        type=int,
+        default=15,
+        help="Seconds between each port's discovery scan while the monitor is running.",
+    )
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Render a persistent terminal dashboard instead of a one-time JSON dump.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -274,6 +440,18 @@ def main() -> int:
 
     ports = args.port or enumerate_serial_ports()
     logger.info("Starting Daly BMS discovery across %d port(s)", len(ports))
+
+    registry = PortRegistry(logger=logger)
+    for port in ports:
+        registry.add_port(port, bitmask=bitmask, timeout=args.timeout, interval=args.scan_interval)
+
+    if args.dashboard:
+        try:
+            registry.start_all()
+            run_dashboard(registry, refresh_seconds=1.0)
+        finally:
+            registry.stop_all()
+        return 0
 
     discovered = discover_all_ports(bitmask=bitmask, ports=ports, timeout=args.timeout, logger=logger)
     print(json.dumps(discovered, indent=2, sort_keys=True))
