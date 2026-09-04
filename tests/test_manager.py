@@ -75,6 +75,19 @@ Found 2 BMS devices.
         self.assertNotIn("Missing BMSs:", dashboard)
         self.assertNotIn("1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16", dashboard)
 
+    def test_port_registry_refresh_ports_tracks_usb_hotplug_events(self):
+        registry = PortRegistry()
+        registry.add_port("/dev/ttyUSB0")
+
+        with patch("manager.enumerate_serial_ports", return_value=["/dev/ttyUSB0", "/dev/ttyUSB1"]):
+            registry.refresh_ports()
+        self.assertIn("/dev/ttyUSB1", registry.monitors)
+
+        with patch("manager.enumerate_serial_ports", return_value=["/dev/ttyUSB1"]):
+            registry.refresh_ports()
+        self.assertNotIn("/dev/ttyUSB0", registry.monitors)
+        self.assertIn("/dev/ttyUSB1", registry.monitors)
+
     def test_discover_port_via_library_uses_dalybms_for_each_candidate(self):
         class FakeSerial:
             def __init__(self):

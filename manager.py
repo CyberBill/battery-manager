@@ -459,6 +459,27 @@ class PortRegistry:
             self.monitors[port] = monitor
         return self.monitors[port]
 
+    def refresh_ports(
+        self,
+        bitmask: int = DEFAULT_DISCOVER_MASK,
+        timeout: int = 60,
+        interval: int = 15,
+    ) -> set[str]:
+        """Re-enumerate serial ports so USB hot-plug events add or remove monitors automatically."""
+        current_ports = set(enumerate_serial_ports())
+        present_ports = set(self.monitors)
+
+        for port in sorted(current_ports - present_ports):
+            self.logger.info("Detected new serial port %s; adding monitor.", port)
+            self.add_port(port, bitmask=bitmask, timeout=timeout, interval=interval)
+
+        for port in sorted(present_ports - current_ports):
+            self.logger.warning("Serial port %s disappeared; removing monitor.", port)
+            monitor = self.monitors.pop(port)
+            monitor.stop()
+
+        return set(self.monitors)
+
     def start_all(self) -> None:
         for monitor in self.monitors.values():
             monitor.start()
@@ -582,6 +603,7 @@ def run_dashboard(
         return
 
     while True:
+        registry.refresh_ports()
         print("\033[H\033[J", end="")
         print(registry.render_dashboard(mqtt_status=mqtt_status))
         key = _read_dashboard_key(refresh_seconds)
