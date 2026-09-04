@@ -22,7 +22,15 @@ except ImportError:  # pragma: no cover - pyserial is required for runtime use.
     list_ports = None
 
 
-DEFAULT_DISCOVER_MASK = 0xFFFFFFFF
+DALY_BMS_MAX_ID = 16
+DEFAULT_DISCOVER_MASK = (1 << DALY_BMS_MAX_ID) - 1
+
+
+def normalize_discover_mask(bitmask: int, max_ids: int = DALY_BMS_MAX_ID) -> int:
+    """Clip a bitmask to Daly's supported BMS ID range (1..16)."""
+    if max_ids <= 0:
+        return 0
+    return bitmask & ((1 << max_ids) - 1)
 
 
 def filter_serial_ports(raw_ports: Iterable[str]) -> list[str]:
@@ -97,9 +105,9 @@ def parse_discover_output(output: str) -> list[int]:
     return ordered
 
 
-def bitmask_to_ids(bitmask: int, max_ids: int = 32) -> list[int]:
-    """Convert a 32-bit unsigned bitmask to the list of BMS IDs represented by the set bits."""
-    bitmask &= 0xFFFFFFFF
+def bitmask_to_ids(bitmask: int, max_ids: int = DALY_BMS_MAX_ID) -> list[int]:
+    """Convert a Daly-compatible bitmask to the list of BMS IDs represented by the set bits."""
+    bitmask = normalize_discover_mask(bitmask, max_ids=max_ids)
     ids: list[int] = []
     for bms_id in range(1, max_ids + 1):
         if bitmask & (1 << (bms_id - 1)):
@@ -259,8 +267,13 @@ def discover_port_via_library(
         raise RuntimeError("The dalybms package is required for direct discovery and publishing.") from exc
 
     discovered: list[int] = []
+    seen_ids: set[int] = set()
     scan_timeout = 0.05
     for bms_id in bitmask_to_ids(bitmask):
+        if bms_id in seen_ids:
+            logger.debug("Skipping BMS ID %s on %s because it was already discovered on this bus.", bms_id, port)
+            continue
+
         bms = DalyBMS(request_retries=1, address=4, bms_id=bms_id, logger=probe_logger)
         try:
             bms.connect(device=port, timeout=scan_timeout)
@@ -273,6 +286,7 @@ def discover_port_via_library(
             except Exception:
                 board_info = False
             if board_info:
+                seen_ids.add(bms_id)
                 discovered.append(bms_id)
                 logger.info("Port %s discovered BMS ID %s", port, bms_id)
         except Exception as exc:  # pragma: no cover - hardware-dependent path.
@@ -486,12 +500,6 @@ class PortRegistry:
                 last_text = time.strftime("%H:%M:%S", time.localtime(monitor.last_scan))
             lines.append(f"{monitor.port:<{port_width}}  {monitor.status_summary():<{status_width}}  {last_text}")
 
-        expected_ids = sorted({bms_id for monitor in self.monitors.values() for bms_id in bitmask_to_ids(monitor.bitmask)})
-        discovered_ids = sorted({item for monitor in self.monitors.values() for item in monitor.discovered})
-        missing_ids = [bms_id for bms_id in expected_ids if bms_id not in discovered_ids]
-
-        lines.append("-" * 96)
-        lines.append(f"Missing BMSs: {', '.join(str(item) for item in missing_ids) if missing_ids else 'none'}")
         return "\n".join(lines)
 
 
@@ -643,7 +651,7 @@ def main() -> int:
     logger = logging.getLogger("battery_manager")
 
     try:
-        bitmask = int(args.bitmask, 0)
+        bitmask = normalize_discover_mask(int(args.bitmask, 0))
     except ValueError as exc:
         parser.error(f"Invalid bitmask: {args.bitmask!r} ({exc})")
 

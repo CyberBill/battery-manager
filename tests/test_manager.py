@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from manager import (
+    DALY_BMS_MAX_ID,
     PortRegistry,
     bind_dashboard_monitor_updates,
     bitmask_to_ids,
@@ -60,18 +61,19 @@ Found 2 BMS devices.
     def test_bitmask_to_ids_returns_ids_in_bit_order(self):
         self.assertEqual(bitmask_to_ids(0x0000001F), [1, 2, 3, 4, 5])
         self.assertEqual(bitmask_to_ids(0x00000380), [8, 9, 10])
-        self.assertEqual(bitmask_to_ids(0x80000000), [32])
-        self.assertEqual(bitmask_to_ids(0xFFFFFFFF), list(range(1, 33)))
+        self.assertEqual(bitmask_to_ids(0x00008000), [16])
+        self.assertEqual(bitmask_to_ids(0xFFFFFFFF), list(range(1, DALY_BMS_MAX_ID + 1)))
+        self.assertEqual(bitmask_to_ids(0xFFFFFFFF, max_ids=16), list(range(1, 17)))
 
-    def test_render_dashboard_includes_missing_bms_row(self):
+    def test_render_dashboard_omits_missing_bms_row(self):
         registry = PortRegistry()
         registry.add_port("/dev/ttyACM0")
         registry.monitors["/dev/ttyACM0"].discovered = [7, 8]
 
         dashboard = registry.render_dashboard()
 
-        self.assertIn("Missing BMSs:", dashboard)
-        self.assertIn("1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16", dashboard)
+        self.assertNotIn("Missing BMSs:", dashboard)
+        self.assertNotIn("1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16", dashboard)
 
     def test_discover_port_via_library_uses_dalybms_for_each_candidate(self):
         class FakeSerial:
