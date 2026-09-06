@@ -268,6 +268,7 @@ def discover_port_via_library(
 
     discovered: list[int] = []
     seen_ids: set[int] = set()
+    saw_io_failure = False
     scan_timeout = 0.05
     for bms_id in bitmask_to_ids(bitmask):
         if bms_id in seen_ids:
@@ -290,11 +291,15 @@ def discover_port_via_library(
                 discovered.append(bms_id)
                 logger.info("Port %s discovered BMS ID %s", port, bms_id)
         except Exception as exc:  # pragma: no cover - hardware-dependent path.
+            saw_io_failure = True
             logger.debug("No response from BMS ID %s on %s: %s", bms_id, port, exc)
         finally:
             serial_obj = getattr(bms, "serial", None)
             if serial_obj is not None and getattr(serial_obj, "is_open", False):
                 bms.disconnect()
+
+    if not discovered and saw_io_failure:
+        raise RuntimeError(f"Port {port} is not responding to Daly discovery; serial I/O failed for every candidate ID.")
 
     return discovered
 
@@ -374,7 +379,7 @@ class PortMonitor:
         except Exception as exc:  # pragma: no cover - runtime hardware dependent path.
             self.error = str(exc)
             self.discovered = []
-            self.logger.error("%s: discovery monitor error (%s)", self.port, exc)
+            self.logger.warning("%s: discovery monitor error (%s)", self.port, exc)
             return []
 
     def run(self) -> None:
@@ -444,7 +449,7 @@ class PortMonitor:
         if self.discovered:
             return f"BMS: {', '.join(str(item) for item in self.discovered)}"
         if self.error:
-            return f"ERROR: {self.error}"
+            return "ERROR"
         return "BMS: none"
 
 
@@ -452,11 +457,15 @@ class PortRegistry:
     def __init__(self, logger: logging.Logger | None = None):
         self.logger = logger or logging.getLogger("battery_manager")
         self.monitors: dict[str, PortMonitor] = {}
+        self._mqtt_config: dict[str, object] | None = None
 
     def add_port(self, port: str, bitmask: int = DEFAULT_DISCOVER_MASK, timeout: int = 60, interval: int = 15) -> PortMonitor:
         if port not in self.monitors:
             monitor = PortMonitor(port=port, bitmask=bitmask, timeout=timeout, interval=interval, logger=self.logger)
             self.monitors[port] = monitor
+            monitor.start()
+            if self._mqtt_config is not None:
+                monitor.on_update = _make_mqtt_update_callback(monitor, self._mqtt_config)
         return self.monitors[port]
 
     def refresh_ports(
@@ -477,6 +486,10 @@ class PortRegistry:
             self.logger.warning("Serial port %s disappeared; removing monitor.", port)
             monitor = self.monitors.pop(port)
             monitor.stop()
+
+        if self._mqtt_config is not None:
+            for monitor in self.monitors.values():
+                monitor.on_update = _make_mqtt_update_callback(monitor, self._mqtt_config)
 
         return set(self.monitors)
 
@@ -524,30 +537,38 @@ class PortRegistry:
         return "\n".join(lines)
 
 
+def _make_mqtt_update_callback(
+    monitor: PortMonitor,
+    mqtt_config: dict[str, object] | None,
+) -> Callable[[], None]:
+    def on_update() -> None:
+        if not mqtt_config:
+            return
+        mqtt_ready = bool(mqtt_config.get("enabled", True))
+        if not mqtt_ready:
+            return
+        if not monitor.discovered:
+            return
+        mqtt_cfg_for_call = {
+            "enabled": True,
+            "broker": mqtt_config.get("broker"),
+            "user": mqtt_config.get("user"),
+            "password": mqtt_config.get("password"),
+            "port": mqtt_config.get("port", 1883),
+        }
+        monitor.publish_report(mqtt_cfg_for_call)
+
+    return on_update
+
+
 def bind_dashboard_monitor_updates(registry: PortRegistry, mqtt_config: dict[str, object] | None = None) -> None:
     """Attach each monitor update callback to MQTT publication when MQTT credentials are available."""
+    registry._mqtt_config = mqtt_config
     if not registry.monitors:
         return
 
     for monitor in registry.monitors.values():
-        def on_update(monitor_ref: PortMonitor = monitor, mqtt_cfg: dict[str, object] | None = mqtt_config):
-            if not mqtt_cfg:
-                return
-            mqtt_ready = bool(mqtt_cfg.get("enabled", True))
-            if not mqtt_ready:
-                return
-            if not monitor_ref.discovered:
-                return
-            mqtt_cfg_for_call = {
-                "enabled": True,
-                "broker": mqtt_cfg.get("broker"),
-                "user": mqtt_cfg.get("user"),
-                "password": mqtt_cfg.get("password"),
-                "port": mqtt_cfg.get("port", 1883),
-            }
-            monitor_ref.publish_report(mqtt_cfg_for_call)
-
-        monitor.on_update = on_update
+        monitor.on_update = _make_mqtt_update_callback(monitor, mqtt_config)
 
 
 def get_missing_mqtt_fields(mqtt_broker: str | None, mqtt_user: str | None, mqtt_password: str | None) -> list[str]:

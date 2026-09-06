@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 from manager import (
     DALY_BMS_MAX_ID,
+    PortMonitor,
     PortRegistry,
     bind_dashboard_monitor_updates,
     bitmask_to_ids,
@@ -88,6 +89,32 @@ Found 2 BMS devices.
         self.assertNotIn("/dev/ttyUSB0", registry.monitors)
         self.assertIn("/dev/ttyUSB1", registry.monitors)
 
+    def test_monitor_status_summary_uses_error_label(self):
+        monitor = PortMonitor(port="/dev/ttyUSB0")
+        monitor.error = "device reset"
+
+        self.assertEqual(monitor.status_summary(), "ERROR")
+
+    def test_port_registry_refresh_ports_starts_new_monitors(self):
+        registry = PortRegistry()
+        mqtt_config = {
+            "enabled": True,
+            "broker": "homeassistant",
+            "user": "daly",
+            "password": "secret",
+        }
+
+        bind_dashboard_monitor_updates(registry, mqtt_config)
+        with patch("manager.enumerate_serial_ports", return_value=["/dev/ttyUSB0", "/dev/ttyUSB1"]):
+            registry.refresh_ports()
+
+        self.assertIn("/dev/ttyUSB0", registry.monitors)
+        self.assertIn("/dev/ttyUSB1", registry.monitors)
+        self.assertIsNotNone(registry.monitors["/dev/ttyUSB0"].on_update)
+        self.assertIsNotNone(registry.monitors["/dev/ttyUSB1"].on_update)
+        self.assertTrue(registry.monitors["/dev/ttyUSB0"].thread is not None and registry.monitors["/dev/ttyUSB0"].thread.is_alive())
+        self.assertTrue(registry.monitors["/dev/ttyUSB1"].thread is not None and registry.monitors["/dev/ttyUSB1"].thread.is_alive())
+
     def test_discover_port_via_library_uses_dalybms_for_each_candidate(self):
         class FakeSerial:
             def __init__(self):
@@ -116,6 +143,23 @@ Found 2 BMS devices.
             discovered = discover_port_via_library("/dev/ttyUSB0", bitmask=0xFFFFFFFF, logger=None)
 
         self.assertEqual(discovered, [2, 5])
+
+    def test_discover_port_via_library_raises_on_unresponsive_serial_port(self):
+        class FakeDalyBMS:
+            def __init__(self, request_retries, address, bms_id, logger):
+                self.bms_id = bms_id
+                self.logger = logger
+                self.serial = None
+
+            def connect(self, device, timeout=None):
+                raise OSError("device reset")
+
+            def disconnect(self):
+                self.serial = None
+
+        with patch("dalybms.DalyBMS", FakeDalyBMS):
+            with self.assertRaisesRegex(RuntimeError, "not responding to Daly discovery"):
+                discover_port_via_library("/dev/ttyUSB0", bitmask=0x00000001, logger=None)
 
     def test_discover_port_via_library_uses_quiet_probe_logger(self):
         created = []
