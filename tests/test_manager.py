@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from manager import (
@@ -10,8 +11,10 @@ from manager import (
     build_mqtt_device_identity,
     build_mqtt_hass_config_discovery,
     discover_port_via_library,
+    enumerate_serial_ports,
     filter_serial_ports,
     get_missing_mqtt_fields,
+    is_excluded_port,
     mqtt_iterator,
     parse_discover_output,
     should_quit_dashboard_key,
@@ -42,6 +45,59 @@ class ManagerTests(unittest.TestCase):
                 "/dev/ttyAMA0",
             ],
         )
+
+    def test_is_excluded_port_handles_multiple_exclusions(self):
+        self.assertTrue(
+            is_excluded_port(
+                "/dev/ttyUSB0",
+                excluded_ports=["/dev/ttyUSB0", "/dev/ttyUSB1"],
+                excluded_port_ids=["usb-VictronEnergy_BV_VE_Direct_cable_ABC123-if00-port0"],
+            )
+        )
+        self.assertTrue(
+            is_excluded_port(
+                "/dev/ttyAMA10",
+                excluded_ports=["/dev/ttyUSB0"],
+                excluded_port_ids=["usb-VictronEnergy_BV_VE_Direct_cable_ABC123-if00-port0"],
+            )
+        )
+        self.assertFalse(
+            is_excluded_port(
+                "/dev/ttyUSB3",
+                excluded_ports=["/dev/ttyUSB0", "/dev/ttyUSB1"],
+                excluded_port_ids=["usb-VictronEnergy_BV_VE_Direct_cable_ABC123-if00-port0"],
+            )
+        )
+
+    def test_is_excluded_port_matches_by_id_symlink_name(self):
+        with patch("manager.Path.iterdir") as mock_iterdir:
+            mock_iterdir.return_value = [
+                Path("/dev/serial/by-id/usb-VictronEnergy_BV_VE_Direct_cable_VE9IUP7O-if00-port0"),
+            ]
+            with patch("manager.os.path.realpath", return_value="/dev/ttyUSB0"):
+                self.assertTrue(
+                    is_excluded_port(
+                        "/dev/ttyUSB0",
+                        excluded_port_ids=["usb-VictronEnergy_BV_VE_Direct_cable_VE9IUP7O-if00-port0"],
+                    )
+                )
+
+    def test_enumerate_serial_ports_ignores_internal_uart_defaults(self):
+        ports = [
+            "/dev/ttyAMA10",
+            "/dev/ttyS0",
+            "/dev/ttyUSB0",
+            "/dev/ttyACM0",
+            "/dev/pts/3",
+        ]
+
+        filtered = enumerate_serial_ports(
+            excluded_ports=[],
+            excluded_port_ids=[],
+            excluded_patterns=["/dev/ttyAMA*", "/dev/ttyS*"],
+        )
+        self.assertNotIn("/dev/ttyAMA10", filtered)
+        self.assertNotIn("/dev/ttyS0", filtered)
 
     def test_parse_discover_output_extracts_bms_ids(self):
         sample = """

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ except ImportError:  # pragma: no cover - pyserial is required for runtime use.
 
 DALY_BMS_MAX_ID = 16
 DEFAULT_DISCOVER_MASK = (1 << DALY_BMS_MAX_ID) - 1
+DEFAULT_EXCLUDED_PORT_PATTERNS = ("/dev/ttyAMA*", "/dev/ttyS*")
 
 
 def normalize_discover_mask(bitmask: int, max_ids: int = DALY_BMS_MAX_ID) -> int:
@@ -59,7 +61,80 @@ def filter_serial_ports(raw_ports: Iterable[str]) -> list[str]:
     return candidates
 
 
-def enumerate_serial_ports() -> list[str]:
+def port_identity_candidates(port: str) -> set[str]:
+    """Return all relevant path and stable-ID aliases for a serial port."""
+    candidates: set[str] = set()
+    if not port:
+        return candidates
+
+    path = str(port).strip()
+    for value in (path, Path(path).name, Path(path).stem):
+        if value:
+            candidates.add(value)
+
+    try:
+        resolved = str(Path(path).resolve(strict=False))
+    except Exception:
+        resolved = path
+    for value in (resolved, Path(resolved).name, Path(resolved).stem):
+        if value:
+            candidates.add(value)
+
+    for base in ("/dev/serial/by-id", "/dev/serial/by-path"):
+        base_path = Path(base)
+        if not base_path.exists():
+            continue
+        for entry in sorted(base_path.iterdir()):
+            try:
+                target = os.path.realpath(str(entry))
+            except OSError:
+                continue
+            if target == path or target == resolved:
+                candidates.add(entry.name)
+                candidates.add(str(entry))
+                candidates.add(entry.stem)
+
+    return candidates
+
+
+def is_excluded_port(
+    port: str,
+    *,
+    excluded_ports: Sequence[str] | None = None,
+    excluded_port_ids: Sequence[str] | None = None,
+    excluded_patterns: Sequence[str] | None = None,
+) -> bool:
+    """Return True when a port path or stable serial ID is explicitly excluded."""
+    if not port:
+        return False
+
+    excluded_ports = {str(item).strip() for item in (excluded_ports or ()) if str(item).strip()}
+    excluded_port_ids = {str(item).strip() for item in (excluded_port_ids or ()) if str(item).strip()}
+    excluded_patterns = tuple(excluded_patterns or DEFAULT_EXCLUDED_PORT_PATTERNS)
+
+    path = str(port).strip()
+    if path in excluded_ports:
+        return True
+
+    if any(path.startswith(pattern.rstrip("*")) for pattern in excluded_patterns if pattern.endswith("*")):
+        return True
+
+    if any(fnmatch.fnmatch(path, pattern) for pattern in excluded_patterns):
+        return True
+
+    candidate_ids = port_identity_candidates(path)
+    if any(item in excluded_port_ids for item in candidate_ids):
+        return True
+
+    return False
+
+
+def enumerate_serial_ports(
+    *,
+    excluded_ports: Sequence[str] | None = None,
+    excluded_port_ids: Sequence[str] | None = None,
+    excluded_patterns: Sequence[str] | None = None,
+) -> list[str]:
     """Collect available serial ports, preferring pyserial and falling back to /dev discovery."""
     ports: list[str] = []
 
@@ -80,7 +155,16 @@ def enumerate_serial_ports() -> list[str]:
         for pattern in ("/dev/tty*", "/dev/ttyUSB*", "/dev/ttyACM*", "/dev/cu.*"):
             ports.extend(sorted(Path().glob(pattern)))
 
-    return filter_serial_ports(ports)
+    filtered = filter_serial_ports(ports)
+    return [
+        port for port in filtered
+        if not is_excluded_port(
+            port,
+            excluded_ports=excluded_ports,
+            excluded_port_ids=excluded_port_ids,
+            excluded_patterns=excluded_patterns,
+        )
+    ]
 
 
 def parse_discover_output(output: str) -> list[int]:
@@ -454,12 +538,30 @@ class PortMonitor:
 
 
 class PortRegistry:
-    def __init__(self, logger: logging.Logger | None = None):
+    def __init__(
+        self,
+        logger: logging.Logger | None = None,
+        *,
+        excluded_ports: Sequence[str] | None = None,
+        excluded_port_ids: Sequence[str] | None = None,
+        excluded_patterns: Sequence[str] | None = None,
+    ):
         self.logger = logger or logging.getLogger("battery_manager")
         self.monitors: dict[str, PortMonitor] = {}
         self._mqtt_config: dict[str, object] | None = None
+        self.excluded_ports = tuple(excluded_ports or ())
+        self.excluded_port_ids = tuple(excluded_port_ids or ())
+        self.excluded_patterns = tuple(excluded_patterns or DEFAULT_EXCLUDED_PORT_PATTERNS)
 
     def add_port(self, port: str, bitmask: int = DEFAULT_DISCOVER_MASK, timeout: int = 60, interval: int = 15) -> PortMonitor:
+        if is_excluded_port(
+            port,
+            excluded_ports=self.excluded_ports,
+            excluded_port_ids=self.excluded_port_ids,
+            excluded_patterns=self.excluded_patterns,
+        ):
+            self.logger.debug("Skipping excluded serial port %s", port)
+            raise ValueError(f"Port {port} is excluded from scanning.")
         if port not in self.monitors:
             monitor = PortMonitor(port=port, bitmask=bitmask, timeout=timeout, interval=interval, logger=self.logger)
             self.monitors[port] = monitor
@@ -475,7 +577,13 @@ class PortRegistry:
         interval: int = 15,
     ) -> set[str]:
         """Re-enumerate serial ports so USB hot-plug events add or remove monitors automatically."""
-        current_ports = set(enumerate_serial_ports())
+        current_ports = set(
+            enumerate_serial_ports(
+                excluded_ports=self.excluded_ports,
+                excluded_port_ids=self.excluded_port_ids,
+                excluded_patterns=self.excluded_patterns,
+            )
+        )
         present_ports = set(self.monitors)
 
         for port in sorted(current_ports - present_ports):
@@ -685,6 +793,18 @@ def main() -> int:
         default=None,
         help="MQTT password to authenticate Daly BMS publishing.",
     )
+    parser.add_argument(
+        "--exclude-port",
+        action="append",
+        default=[],
+        help="Serial path to ignore. May be provided more than once.",
+    )
+    parser.add_argument(
+        "--exclude-port-id",
+        action="append",
+        default=[],
+        help="Stable serial ID to ignore. May be provided more than once.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -698,10 +818,28 @@ def main() -> int:
     except ValueError as exc:
         parser.error(f"Invalid bitmask: {args.bitmask!r} ({exc})")
 
-    ports = args.port or enumerate_serial_ports()
+    excluded_ports = list(dict.fromkeys(args.exclude_port or []))
+    excluded_port_ids = list(dict.fromkeys(args.exclude_port_id or []))
+    ports = args.port or enumerate_serial_ports(
+        excluded_ports=excluded_ports,
+        excluded_port_ids=excluded_port_ids,
+    )
+    if args.port:
+        ports = [
+            port for port in args.port
+            if not is_excluded_port(
+                port,
+                excluded_ports=excluded_ports,
+                excluded_port_ids=excluded_port_ids,
+            )
+        ]
     logger.info("Starting Daly BMS discovery across %d port(s)", len(ports))
 
-    registry = PortRegistry(logger=logger)
+    registry = PortRegistry(
+        logger=logger,
+        excluded_ports=excluded_ports,
+        excluded_port_ids=excluded_port_ids,
+    )
     for port in ports:
         registry.add_port(port, bitmask=bitmask, timeout=args.timeout, interval=args.scan_interval)
 
