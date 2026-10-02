@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -6,8 +7,10 @@ from manager import (
     DALY_BMS_MAX_ID,
     PortMonitor,
     PortRegistry,
+    BatteryConfiguration,
     bind_dashboard_monitor_updates,
     bitmask_to_ids,
+    build_bms_management_payload,
     build_mqtt_device_identity,
     build_mqtt_hass_config_discovery,
     discover_port_via_library,
@@ -15,6 +18,7 @@ from manager import (
     filter_serial_ports,
     get_missing_mqtt_fields,
     is_excluded_port,
+    load_battery_configuration,
     mqtt_iterator,
     parse_discover_output,
     should_quit_dashboard_key,
@@ -22,6 +26,10 @@ from manager import (
 
 
 class ManagerTests(unittest.TestCase):
+    @staticmethod
+    def battery_config() -> BatteryConfiguration:
+        return BatteryConfiguration(batteries_by_serial={})
+
     def test_filter_serial_ports_keeps_raspberry_serial_candidates(self):
         raw_ports = [
             "/dev/ttyS0",
@@ -123,7 +131,7 @@ Found 2 BMS devices.
         self.assertEqual(bitmask_to_ids(0xFFFFFFFF, max_ids=16), list(range(1, 17)))
 
     def test_render_dashboard_omits_missing_bms_row(self):
-        registry = PortRegistry()
+        registry = PortRegistry(battery_config=self.battery_config())
         registry.add_port("/dev/ttyACM0")
         registry.monitors["/dev/ttyACM0"].discovered = [7, 8]
 
@@ -132,8 +140,41 @@ Found 2 BMS devices.
         self.assertNotIn("Missing BMSs:", dashboard)
         self.assertNotIn("1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16", dashboard)
 
+    def test_render_dashboard_shows_cumulative_cell_voltage_summary(self):
+        registry = PortRegistry(battery_config=self.battery_config())
+        registry.add_port("/dev/ttyACM0")
+        registry.add_port("/dev/ttyUSB0")
+        registry.record_bms_payload(
+            "/dev/ttyACM0:1",
+            {
+                "cell_voltage_range": {
+                    "lowest_voltage": 3.21,
+                    "highest_voltage": 3.42,
+                },
+                "pack_voltage": 51.2,
+            },
+        )
+        registry.record_bms_payload(
+            "/dev/ttyUSB0:2",
+            {
+                "cell_voltage_range": {
+                    "lowest_voltage": 3.19,
+                    "highest_voltage": 3.51,
+                },
+                "temperature": 26.4,
+            },
+        )
+
+        dashboard = registry.render_dashboard()
+
+        self.assertIn("Cumulative Battery Data", dashboard)
+        self.assertIn("Sources: 2", dashboard)
+        self.assertIn("Voltage summaries: 2", dashboard)
+        self.assertIn("Min cell voltage: 3.190 V", dashboard)
+        self.assertIn("Max cell voltage: 3.510 V", dashboard)
+
     def test_port_registry_refresh_ports_tracks_usb_hotplug_events(self):
-        registry = PortRegistry()
+        registry = PortRegistry(battery_config=self.battery_config())
         registry.add_port("/dev/ttyUSB0")
 
         with patch("manager.enumerate_serial_ports", return_value=["/dev/ttyUSB0", "/dev/ttyUSB1"]):
@@ -152,7 +193,7 @@ Found 2 BMS devices.
         self.assertEqual(monitor.status_summary(), "ERROR")
 
     def test_port_registry_refresh_ports_starts_new_monitors(self):
-        registry = PortRegistry()
+        registry = PortRegistry(battery_config=self.battery_config())
         mqtt_config = {
             "enabled": True,
             "broker": "homeassistant",
@@ -248,7 +289,7 @@ Found 2 BMS devices.
         self.assertEqual(created[0].name, "battery_manager.discovery_probe")
 
     def test_dashboard_monitor_updates_publish_when_mqtt_enabled(self):
-        registry = PortRegistry()
+        registry = PortRegistry(battery_config=self.battery_config())
         registry.add_port("/dev/ttyACM0")
         monitor = registry.monitors["/dev/ttyACM0"]
         monitor.discovered = [7]
@@ -270,6 +311,49 @@ Found 2 BMS devices.
 
         self.assertEqual(calls, [{**mqtt_config, "port": 1883}])
 
+    def test_dashboard_monitor_updates_record_nested_payload_for_summary(self):
+        registry = PortRegistry(battery_config=self.battery_config())
+        registry.add_port("/dev/ttyACM0")
+        monitor = registry.monitors["/dev/ttyACM0"]
+        monitor.discovered = [9]
+
+        def fake_publish(_config):
+            return [
+                {
+                    "bms_id": 9,
+                    "status": "ok",
+                    "payload": {
+                        "bms_id": 9,
+                        "status": "ok",
+                        "serial_number": "221KL280200079",
+                        "topic_root": "battery/daly/221KL280200079",
+                        "payload": {
+                            "cell_voltage_range": {
+                                "lowest_voltage": 3.779,
+                                "highest_voltage": 3.831,
+                            }
+                        },
+                    },
+                }
+            ]
+
+        monitor.publish_report = fake_publish
+        mqtt_config = {
+            "enabled": True,
+            "broker": "homeassistant",
+            "user": "daly",
+            "password": "secret",
+        }
+
+        bind_dashboard_monitor_updates(registry, mqtt_config)
+        monitor.on_update()
+
+        summary = registry.cumulative_battery_summary()
+        self.assertEqual(summary.get("sources"), 1)
+        self.assertEqual(summary.get("voltage_summaries"), 1)
+        self.assertEqual(summary.get("min_cell_voltage"), 3.779)
+        self.assertEqual(summary.get("max_cell_voltage"), 3.831)
+
     def test_build_mqtt_device_identity_matches_cli_naming(self):
         device_id, device_name, topic_root = build_mqtt_device_identity("ABC-123")
 
@@ -283,6 +367,59 @@ Found 2 BMS devices.
         self.assertEqual(device_id, "daly_bms")
         self.assertEqual(device_name, "Daly BMS")
         self.assertEqual(topic_root, "daly_bms")
+
+    def test_load_battery_configuration_reads_serial_metadata(self):
+        battery_config = load_battery_configuration(Path(__file__).parent.parent / "battery-config.json")
+
+        battery = battery_config.find_battery("221KL280200318")
+
+        self.assertIsNotNone(battery)
+        assert battery is not None
+        self.assertEqual(battery.id, 1)
+        self.assertEqual(battery.cabinet, 1)
+        self.assertEqual(battery.row, 2)
+        self.assertEqual(battery.depth, 2)
+
+    def test_management_payload_uses_configured_metadata_and_temporary_safety_values(self):
+        battery_config = load_battery_configuration(Path(__file__).parent.parent / "battery-config.json")
+
+        self.assertEqual(
+            build_bms_management_payload(battery_config, "221KL280200318"),
+            {
+                "id": 1,
+                "cabinet": 1,
+                "row": 2,
+                "depth": 2,
+                "safe": True,
+                "safety_reason": "OK",
+            },
+        )
+
+    def test_management_payload_uses_home_assistant_unknown_for_unknown_or_unset_location_data(self):
+        battery_config = load_battery_configuration(Path(__file__).parent.parent / "battery-config.json")
+
+        self.assertEqual(
+            build_bms_management_payload(battery_config, "unknown-serial"),
+            {
+                "id": "None",
+                "cabinet": "None",
+                "row": "None",
+                "depth": "None",
+                "safe": True,
+                "safety_reason": "OK",
+            },
+        )
+        self.assertEqual(
+            build_bms_management_payload(battery_config, "221KL280200089"),
+            {
+                "id": 7,
+                "cabinet": "None",
+                "row": "None",
+                "depth": "None",
+                "safe": True,
+                "safety_reason": "OK",
+            },
+        )
 
     def test_mqtt_iterator_uses_library_adapter_humanized_hass_paths(self):
         mqtt_client = MagicMock()
@@ -314,6 +451,41 @@ Found 2 BMS devices.
         self.assertEqual(discovery_topic, "homeassistant/sensor/daly_abc_123/cell_voltages_12/config")
         self.assertIn('"name": "Cell 12 Voltage"', payload)
         self.assertIn('"state_topic": "battery/daly/ABC123/cell_voltages/12"', payload)
+
+    def test_mqtt_iterator_publishes_management_entities(self):
+        mqtt_client = MagicMock()
+        mqtt_client.publish.return_value.rc = 0
+        mqtt_client.publish.return_value.wait_for_publish.return_value = None
+        logger = MagicMock()
+
+        mqtt_iterator(
+            {
+                "id": 1,
+                "cabinet": 2,
+                "row": 3,
+                "depth": 4,
+                "safe": True,
+                "safety_reason": "OK",
+            },
+            mqtt_client=mqtt_client,
+            logger=logger,
+            topic_root="battery/daly/ABC123",
+            device_id="daly_abc_123",
+            device_name="Daly BMS ABC123",
+            serial_number="ABC123",
+            mqtt_hass=True,
+        )
+
+        messages = {call.args[0]: call.args[1] for call in mqtt_client.publish.call_args_list}
+        id_config = json.loads(messages["homeassistant/sensor/daly_abc_123/id/config"])
+        self.assertEqual(id_config["unique_id"], "daly_abc_123_id")
+        self.assertEqual(id_config["state_topic"], "battery/daly/ABC123/id")
+        self.assertEqual(messages["battery/daly/ABC123/id"], 1)
+        self.assertEqual(messages["battery/daly/ABC123/cabinet"], 2)
+        self.assertEqual(messages["battery/daly/ABC123/row"], 3)
+        self.assertEqual(messages["battery/daly/ABC123/depth"], 4)
+        self.assertIs(messages["battery/daly/ABC123/safe"], True)
+        self.assertEqual(messages["battery/daly/ABC123/safety_reason"], "OK")
 
     def test_get_missing_mqtt_fields_lists_missing_values(self):
         self.assertEqual(
