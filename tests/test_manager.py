@@ -313,8 +313,9 @@ Found 2 BMS devices.
             "password": "secret",
         }
 
-        bind_dashboard_monitor_updates(registry, mqtt_config)
-        monitor.on_update()
+        with patch("manager.publish_virtual_battery_via_library"):
+            bind_dashboard_monitor_updates(registry, mqtt_config)
+            monitor.on_update()
 
         self.assertEqual(calls, [{**mqtt_config, "port": 1883}])
 
@@ -352,14 +353,16 @@ Found 2 BMS devices.
             "password": "secret",
         }
 
-        bind_dashboard_monitor_updates(registry, mqtt_config)
-        monitor.on_update()
+        with patch("manager.publish_virtual_battery_via_library") as publish_virtual:
+            bind_dashboard_monitor_updates(registry, mqtt_config)
+            monitor.on_update()
 
         summary = registry.cumulative_battery_summary()
         self.assertEqual(summary.get("sources"), 1)
         self.assertEqual(summary.get("voltage_summaries"), 1)
         self.assertEqual(summary.get("min_cell_voltage"), 3.779)
         self.assertEqual(summary.get("max_cell_voltage"), 3.831)
+        self.assertEqual(publish_virtual.call_args.args[0].member_count, 0)
 
     def test_build_mqtt_device_identity_matches_cli_naming(self):
         device_id, device_name, topic_root = build_mqtt_device_identity("ABC-123")

@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
+from virtual_battery import VirtualBattery, aggregate_virtual_battery
+
 try:
     import serial.tools.list_ports as list_ports
 except ImportError:  # pragma: no cover - pyserial is required for runtime use.
@@ -451,6 +453,46 @@ def mqtt_iterator(result: dict[str, Any], *, mqtt_client: Any, logger: logging.L
     )
 
 
+def publish_virtual_battery_via_library(
+    virtual_battery: VirtualBattery,
+    *,
+    mqtt_broker: str,
+    mqtt_user: str,
+    mqtt_password: str,
+    mqtt_port: int = 1883,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Publish the aggregate battery as a separate Home Assistant MQTT device."""
+    logger = logger or logging.getLogger("battery_manager")
+    try:
+        from dalybms import DalyBMSMQTT
+        import paho.mqtt.client as paho
+    except ImportError as exc:  # pragma: no cover - environment-specific dependency.
+        raise RuntimeError("The dalybms and paho-mqtt Python packages are required for MQTT publishing.") from exc
+
+    mqtt_client = paho.Client()
+    mqtt_client.username_pw_set(mqtt_user, mqtt_password)
+    mqtt_client.connect(mqtt_broker, port=mqtt_port)
+    mqtt_client.loop_start()
+    try:
+        mqtt_adapter = DalyBMSMQTT(
+            device_id="daly_virtual_battery",
+            device_name=virtual_battery.identifier,
+            topic_root="battery/daly/virtual_battery",
+            serial_number="virtual-battery",
+            logger=logger,
+        )
+        mqtt_adapter.publish(
+            mqtt_client,
+            virtual_battery.mqtt_payload(),
+            include_hass_discovery=True,
+            add_last_active_utc=True,
+        )
+    finally:
+        mqtt_client.disconnect()
+        mqtt_client.loop_stop()
+
+
 def _coerce_number(value: object) -> float | None:
     if isinstance(value, bool):
         return None
@@ -795,16 +837,24 @@ class PortRegistry:
         self.safety_config = safety_config
         self.monitors: dict[str, PortMonitor] = {}
         self.bms_payloads: dict[str, dict[str, Any]] = {}
+        self._payload_lock = threading.RLock()
         self._mqtt_config: dict[str, object] | None = None
         self.excluded_ports = tuple(excluded_ports or ())
         self.excluded_port_ids = tuple(excluded_port_ids or ())
         self.excluded_patterns = tuple(excluded_patterns or DEFAULT_EXCLUDED_PORT_PATTERNS)
 
     def record_bms_payload(self, source: str, payload: dict[str, Any]) -> None:
-        self.bms_payloads[source] = payload
+        with self._payload_lock:
+            self.bms_payloads[source] = payload
 
     def cumulative_battery_summary(self) -> dict[str, object]:
-        return summarize_cumulative_battery_data(self.bms_payloads)
+        with self._payload_lock:
+            return summarize_cumulative_battery_data(self.bms_payloads)
+
+    def virtual_battery(self) -> VirtualBattery:
+        """Return the current aggregate of BMS reports with full rack metadata."""
+        with self._payload_lock:
+            return aggregate_virtual_battery(self.bms_payloads.values())
 
     def add_port(self, port: str, bitmask: int = DEFAULT_DISCOVER_MASK, timeout: int = 60, interval: int = 15) -> PortMonitor:
         if is_excluded_port(
@@ -900,6 +950,7 @@ class PortRegistry:
             )
         else:
             lines.append("  Min cell voltage: n/a   Max cell voltage: n/a")
+        lines.extend(self.virtual_battery().dashboard_lines())
         lines.extend([
             f"{'Port':<{port_width}}  {'Status':<{status_width}}  {'Last Scan'}",
             "-" * 96,
@@ -943,6 +994,18 @@ def _make_mqtt_update_callback(
             bms_id = result.get("bms_id")
             if isinstance(payload, dict) and bms_id is not None:
                 registry.record_bms_payload(f"{monitor.port}:{bms_id}", payload)
+        virtual_battery = registry.virtual_battery()
+        try:
+            publish_virtual_battery_via_library(
+                virtual_battery,
+                mqtt_broker=str(mqtt_cfg_for_call["broker"]),
+                mqtt_user=str(mqtt_cfg_for_call["user"]),
+                mqtt_password=str(mqtt_cfg_for_call["password"]),
+                mqtt_port=int(mqtt_cfg_for_call["port"]),
+                logger=registry.logger,
+            )
+        except Exception as exc:  # pragma: no cover - broker-dependent path.
+            registry.logger.error("Failed to publish virtual battery: %s", exc)
 
     return on_update
 
