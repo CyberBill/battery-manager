@@ -8,6 +8,7 @@ from manager import (
     PortMonitor,
     PortRegistry,
     BatteryConfiguration,
+    SafetyConfiguration,
     bind_dashboard_monitor_updates,
     bitmask_to_ids,
     build_bms_management_payload,
@@ -16,9 +17,11 @@ from manager import (
     discover_port_via_library,
     enumerate_serial_ports,
     filter_serial_ports,
+    evaluate_bms_safety,
     get_missing_mqtt_fields,
     is_excluded_port,
     load_battery_configuration,
+    load_safety_configuration,
     mqtt_iterator,
     parse_discover_output,
     should_quit_dashboard_key,
@@ -29,6 +32,10 @@ class ManagerTests(unittest.TestCase):
     @staticmethod
     def battery_config() -> BatteryConfiguration:
         return BatteryConfiguration(batteries_by_serial={})
+
+    @staticmethod
+    def safety_config() -> SafetyConfiguration:
+        return SafetyConfiguration(35, 0.5, 39, 51, 3.1, 4.18)
 
     def test_filter_serial_ports_keeps_raspberry_serial_candidates(self):
         raw_ports = [
@@ -384,7 +391,7 @@ Found 2 BMS devices.
         battery_config = load_battery_configuration(Path(__file__).parent.parent / "battery-config.json")
 
         self.assertEqual(
-            build_bms_management_payload(battery_config, "221KL280200318"),
+            build_bms_management_payload(battery_config, "221KL280200318", (True, "OK")),
             {
                 "id": 1,
                 "cabinet": 1,
@@ -399,7 +406,7 @@ Found 2 BMS devices.
         battery_config = load_battery_configuration(Path(__file__).parent.parent / "battery-config.json")
 
         self.assertEqual(
-            build_bms_management_payload(battery_config, "unknown-serial"),
+            build_bms_management_payload(battery_config, "unknown-serial", (True, "OK")),
             {
                 "id": "None",
                 "cabinet": "None",
@@ -410,7 +417,7 @@ Found 2 BMS devices.
             },
         )
         self.assertEqual(
-            build_bms_management_payload(battery_config, "221KL280200089"),
+            build_bms_management_payload(battery_config, "221KL280200089", (True, "OK")),
             {
                 "id": 7,
                 "cabinet": "None",
@@ -419,6 +426,44 @@ Found 2 BMS devices.
                 "safe": True,
                 "safety_reason": "OK",
             },
+        )
+
+    def test_load_safety_configuration_and_evaluate_bms_safety(self):
+        safety_config = load_safety_configuration(Path(__file__).parent.parent / "safety-config.json")
+        payload = {
+            "temperature_range": {"highest_temperature": 36},
+            "cell_voltage_range": {"highest_voltage": 3.9, "lowest_voltage": 3.6},
+            "soc": {"total_voltage": 48},
+        }
+
+        self.assertEqual(safety_config.max_temperature_c, 35)
+        self.assertEqual(
+            evaluate_bms_safety(payload, safety_config),
+            (False, "Battery temperature is 36 C (limit 35 C)"),
+        )
+
+    def test_evaluate_bms_safety_checks_highest_cell_voltage(self):
+        payload = {
+            "temperature_range": {"highest_temperature": 30},
+            "cell_voltage_range": {"highest_voltage": 4.19, "lowest_voltage": 3.8},
+            "soc": {"total_voltage": 48},
+        }
+
+        self.assertEqual(
+            evaluate_bms_safety(payload, self.safety_config()),
+            (False, "Cell voltage exceeds safety limit: highest cell is 4.190 V"),
+        )
+
+    def test_evaluate_bms_safety_checks_lowest_cell_voltage(self):
+        payload = {
+            "temperature_range": {"highest_temperature": 30},
+            "cell_voltage_range": {"highest_voltage": 3.5, "lowest_voltage": 3.09},
+            "soc": {"total_voltage": 48},
+        }
+
+        self.assertEqual(
+            evaluate_bms_safety(payload, self.safety_config()),
+            (False, "Cell voltage is below safety limit: lowest cell is 3.090 V (minimum 3.100 V)"),
         )
 
     def test_mqtt_iterator_uses_library_adapter_humanized_hass_paths(self):

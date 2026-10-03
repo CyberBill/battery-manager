@@ -28,6 +28,7 @@ DALY_BMS_MAX_ID = 16
 DEFAULT_DISCOVER_MASK = (1 << DALY_BMS_MAX_ID) - 1
 DEFAULT_EXCLUDED_PORT_PATTERNS = ("/dev/ttyAMA*", "/dev/ttyS*")
 DEFAULT_BATTERY_CONFIG_PATH = Path(__file__).with_name("battery-config.json")
+DEFAULT_SAFETY_CONFIG_PATH = Path(__file__).with_name("safety-config.json")
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,18 @@ class BatteryConfiguration:
 
     def find_battery(self, serial_number: object) -> BatteryMetadata | None:
         return self.batteries_by_serial.get(str(serial_number).strip())
+
+
+@dataclass(frozen=True)
+class SafetyConfiguration:
+    """Per-BMS limits used to decide whether a report is safe."""
+
+    max_temperature_c: float
+    max_cell_voltage_spread_v: float
+    min_pack_voltage_v: float
+    max_pack_voltage_v: float
+    min_cell_voltage_v: float
+    max_cell_voltage_v: float
 
 
 def _require_config_integer(entry: dict[str, object], field_name: str, position: int, *, required: bool) -> int | None:
@@ -103,6 +116,34 @@ def load_battery_configuration(path: str | Path = DEFAULT_BATTERY_CONFIG_PATH) -
         )
 
     return BatteryConfiguration(batteries_by_serial=batteries_by_serial)
+
+
+def _require_config_number(entry: dict[str, object], field_name: str) -> float:
+    value = entry.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"Safety configuration field {field_name!r} must be a number.")
+    return float(value)
+
+
+def load_safety_configuration(path: str | Path = DEFAULT_SAFETY_CONFIG_PATH) -> SafetyConfiguration:
+    """Load BMS safety limits from JSON."""
+    config_path = Path(path)
+    try:
+        raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Safety configuration {config_path} contains invalid JSON: {exc.msg}.") from exc
+
+    if not isinstance(raw_config, dict):
+        raise ValueError(f"Safety configuration {config_path} must be a JSON object.")
+
+    return SafetyConfiguration(
+        max_temperature_c=_require_config_number(raw_config, "max_temperature_c"),
+        max_cell_voltage_spread_v=_require_config_number(raw_config, "max_cell_voltage_spread_v"),
+        min_pack_voltage_v=_require_config_number(raw_config, "min_pack_voltage_v"),
+        max_pack_voltage_v=_require_config_number(raw_config, "max_pack_voltage_v"),
+        min_cell_voltage_v=_require_config_number(raw_config, "min_cell_voltage_v"),
+        max_cell_voltage_v=_require_config_number(raw_config, "max_cell_voltage_v"),
+    )
 
 
 def normalize_discover_mask(bitmask: int, max_ids: int = DALY_BMS_MAX_ID) -> int:
@@ -324,8 +365,9 @@ def build_mqtt_hass_config_discovery(base: str, *, device_id: str, device_name: 
 def build_bms_management_payload(
     battery_config: BatteryConfiguration,
     serial_number: object,
+    safety_result: tuple[bool, str],
 ) -> dict[str, object]:
-    """Return configured metadata, using Home Assistant's ``None`` payload for unknown fields."""
+    """Return configured metadata, safety state, and Home Assistant unknown values."""
     battery = battery_config.find_battery(serial_number)
     payload: dict[str, object] = {
         "id": "None",
@@ -336,10 +378,49 @@ def build_bms_management_payload(
     if battery is not None:
         payload.update(battery.mqtt_payload())
     payload.update({
-        "safe": True,
-        "safety_reason": "OK",
+        "safe": safety_result[0],
+        "safety_reason": safety_result[1],
     })
     return payload
+
+
+def _payload_number(payload: dict[str, Any], section: str, field_name: str) -> float | None:
+    values = payload.get(section)
+    if not isinstance(values, dict):
+        return None
+    return _coerce_number(values.get(field_name))
+
+
+def evaluate_bms_safety(payload: dict[str, Any], safety_config: SafetyConfiguration) -> tuple[bool, str]:
+    """Evaluate a complete Daly payload against the configured per-BMS safety limits."""
+    temperature = _payload_number(payload, "temperature_range", "highest_temperature")
+    if temperature is None:
+        return False, "Missing highest battery temperature"
+    if temperature > safety_config.max_temperature_c:
+        return False, f"Battery temperature is {temperature:g} C (limit {safety_config.max_temperature_c:g} C)"
+
+    highest_voltage = _payload_number(payload, "cell_voltage_range", "highest_voltage")
+    lowest_voltage = _payload_number(payload, "cell_voltage_range", "lowest_voltage")
+    if highest_voltage is None or lowest_voltage is None:
+        return False, "Missing cell voltage range"
+    voltage_spread = highest_voltage - lowest_voltage
+    if voltage_spread > safety_config.max_cell_voltage_spread_v:
+        return False, f"Cell voltage spread is {voltage_spread:.3f} V (limit {safety_config.max_cell_voltage_spread_v:.3f} V)"
+
+    pack_voltage = _payload_number(payload, "soc", "total_voltage")
+    if pack_voltage is None:
+        return False, "Missing pack voltage"
+    if pack_voltage < safety_config.min_pack_voltage_v:
+        return False, f"Pack voltage is {pack_voltage:g} V (minimum {safety_config.min_pack_voltage_v:g} V)"
+    if pack_voltage > safety_config.max_pack_voltage_v:
+        return False, f"Pack voltage is {pack_voltage:g} V (maximum {safety_config.max_pack_voltage_v:g} V)"
+
+    if lowest_voltage < safety_config.min_cell_voltage_v:
+        return False, f"Cell voltage is below safety limit: lowest cell is {lowest_voltage:.3f} V (minimum {safety_config.min_cell_voltage_v:.3f} V)"
+    if highest_voltage > safety_config.max_cell_voltage_v:
+        return False, f"Cell voltage exceeds safety limit: highest cell is {highest_voltage:.3f} V"
+
+    return True, "OK"
 
 
 def mqtt_single_out(mqtt_client: Any, logger: logging.Logger, topic: str, data: object, retain: bool = False) -> None:
@@ -425,6 +506,7 @@ def publish_bms_report_via_library(
     mqtt_password: str,
     mqtt_port: int = 1883,
     battery_config: BatteryConfiguration,
+    safety_config: SafetyConfiguration,
     logger: logging.Logger | None = None,
 ) -> dict[str, object]:
     """Connect to the serial port, read the Daly data directly, and publish it to MQTT via the library API."""
@@ -462,7 +544,8 @@ def publish_bms_report_via_library(
                 serial_number=serial_number,
                 logger=logger,
             )
-            management_payload = build_bms_management_payload(battery_config, serial_number)
+            safety_result = evaluate_bms_safety(result, safety_config)
+            management_payload = build_bms_management_payload(battery_config, serial_number, safety_result)
             if battery_config.find_battery(serial_number) is None:
                 logger.warning("No battery configuration entry found for BMS serial number %s.", serial_number)
             payload = {**result, **management_payload}
@@ -582,6 +665,7 @@ def discover_all_ports(
 class PortMonitor:
     port: str
     battery_config: BatteryConfiguration = field(default_factory=lambda: BatteryConfiguration({}))
+    safety_config: SafetyConfiguration | None = None
     bitmask: int = DEFAULT_DISCOVER_MASK
     timeout: int = 60
     interval: int = 15
@@ -661,6 +745,7 @@ class PortMonitor:
                     mqtt_password=str(mqtt_password),
                     mqtt_port=int(mqtt_config.get("port", 1883)) if mqtt_config else 1883,
                     battery_config=self.battery_config,
+                    safety_config=self.safety_config or load_safety_configuration(),
                     logger=self.logger,
                 )
                 results.append({"bms_id": bms_id, "status": "ok", "payload": payload})
@@ -700,12 +785,14 @@ class PortRegistry:
         logger: logging.Logger | None = None,
         *,
         battery_config: BatteryConfiguration | None = None,
+        safety_config: SafetyConfiguration | None = None,
         excluded_ports: Sequence[str] | None = None,
         excluded_port_ids: Sequence[str] | None = None,
         excluded_patterns: Sequence[str] | None = None,
     ):
         self.logger = logger or logging.getLogger("battery_manager")
         self.battery_config = battery_config or BatteryConfiguration({})
+        self.safety_config = safety_config
         self.monitors: dict[str, PortMonitor] = {}
         self.bms_payloads: dict[str, dict[str, Any]] = {}
         self._mqtt_config: dict[str, object] | None = None
@@ -732,6 +819,7 @@ class PortRegistry:
             monitor = PortMonitor(
                 port=port,
                 battery_config=self.battery_config,
+                safety_config=self.safety_config,
                 bitmask=bitmask,
                 timeout=timeout,
                 interval=interval,
@@ -990,6 +1078,12 @@ def main() -> int:
         help="Path to the JSON file containing BMS serial, ID, and location metadata.",
     )
     parser.add_argument(
+        "--safety-config",
+        type=Path,
+        default=DEFAULT_SAFETY_CONFIG_PATH,
+        help="Path to the JSON file containing per-BMS safety limits.",
+    )
+    parser.add_argument(
         "--exclude-port",
         action="append",
         default=[],
@@ -1011,6 +1105,7 @@ def main() -> int:
 
     try:
         battery_config = load_battery_configuration(args.battery_config)
+        safety_config = load_safety_configuration(args.safety_config)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     logger.info("Loaded metadata for %d battery serial number(s) from %s", len(battery_config.batteries_by_serial), args.battery_config)
@@ -1040,6 +1135,7 @@ def main() -> int:
     registry = PortRegistry(
         logger=logger,
         battery_config=battery_config,
+        safety_config=safety_config,
         excluded_ports=excluded_ports,
         excluded_port_ids=excluded_port_ids,
     )
@@ -1089,6 +1185,7 @@ def main() -> int:
                 monitor = PortMonitor(
                     port=port,
                     battery_config=battery_config,
+                    safety_config=safety_config,
                     bitmask=bitmask,
                     timeout=args.timeout,
                     interval=args.scan_interval,
