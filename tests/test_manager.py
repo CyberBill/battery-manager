@@ -364,6 +364,32 @@ Found 2 BMS devices.
         self.assertEqual(summary.get("max_cell_voltage"), 3.831)
         self.assertEqual(publish_virtual.call_args.args[0].member_count, 0)
 
+    def test_full_charge_cutoff_triggers_soc_sync_once(self):
+        registry = PortRegistry(battery_config=self.battery_config())
+        cutoff_battery = MagicMock(full_charge_cutoff=True, empty_discharge_cutoff=False)
+        normal_battery = MagicMock(full_charge_cutoff=False, empty_discharge_cutoff=False)
+
+        with patch.object(registry, "set_all_bms_state_of_charge_to_100") as sync_soc:
+            registry.process_virtual_battery_safety(cutoff_battery)
+            registry.process_virtual_battery_safety(cutoff_battery)
+            registry.process_virtual_battery_safety(normal_battery)
+            registry.process_virtual_battery_safety(cutoff_battery)
+
+        self.assertEqual(sync_soc.call_count, 2)
+
+    def test_empty_discharge_cutoff_triggers_soc_sync_once(self):
+        registry = PortRegistry(battery_config=self.battery_config())
+        cutoff_battery = MagicMock(full_charge_cutoff=False, empty_discharge_cutoff=True)
+        normal_battery = MagicMock(full_charge_cutoff=False, empty_discharge_cutoff=False)
+
+        with patch.object(registry, "set_all_bms_state_of_charge_to_0") as sync_soc:
+            registry.process_virtual_battery_safety(cutoff_battery)
+            registry.process_virtual_battery_safety(cutoff_battery)
+            registry.process_virtual_battery_safety(normal_battery)
+            registry.process_virtual_battery_safety(cutoff_battery)
+
+        self.assertEqual(sync_soc.call_count, 2)
+
     def test_build_mqtt_device_identity_matches_cli_naming(self):
         device_id, device_name, topic_root = build_mqtt_device_identity("ABC-123")
 
@@ -389,6 +415,50 @@ Found 2 BMS devices.
         self.assertEqual(battery.cabinet, 1)
         self.assertEqual(battery.row, 2)
         self.assertEqual(battery.depth, 2)
+        assert battery_config.virtual_battery_settings is not None
+        self.assertEqual(battery_config.virtual_battery_settings.charge_voltage_limit_v, 49.8)
+        self.assertEqual(battery_config.virtual_battery_settings.discharge_voltage_limit_v, 40.0)
+        self.assertEqual(battery_config.virtual_battery_settings.charge_current_limit_a, 100)
+        self.assertEqual(battery_config.virtual_battery_settings.discharge_current_limit_a, 100)
+        self.assertEqual(battery_config.virtual_battery_settings.state_of_health_percent, 100)
+
+    def test_disabled_battery_is_excluded_only_from_virtual_battery(self):
+        config_path = Path(self.id()).with_suffix(".json")
+        config_path.write_text(json.dumps({
+            "virtual_battery": {
+                "charge_voltage_limit_v": 49.8,
+                "discharge_voltage_limit_v": 40.0,
+                "charge_current_limit_a": 100.0,
+                "discharge_current_limit_a": 100.0,
+                "state_of_health_percent": 100,
+            },
+            "batteries": [{
+                "serial": "disabled-battery",
+                "id": 1,
+                "cabinet": 1,
+                "row": 1,
+                "depth": 1,
+                "virtual_battery_disabled": True,
+            }],
+        }), encoding="utf-8")
+        self.addCleanup(config_path.unlink)
+        battery_config = load_battery_configuration(config_path)
+        registry = PortRegistry(battery_config=battery_config)
+        payload = {
+            "id": 1,
+            "cabinet": 1,
+            "row": 1,
+            "depth": 1,
+            "safe": True,
+            "soc": {},
+            "cell_voltage_range": {},
+            "temperature_range": {},
+        }
+
+        registry.record_bms_payload("/dev/ttyUSB0:1", payload, serial_number="disabled-battery")
+
+        self.assertEqual(registry.bms_payloads, {})
+        self.assertEqual(registry.virtual_battery().configured_member_count, 0)
 
     def test_management_payload_uses_configured_metadata_and_temporary_safety_values(self):
         battery_config = load_battery_configuration(Path(__file__).parent.parent / "battery-config.json")

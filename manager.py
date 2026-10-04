@@ -18,7 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-from virtual_battery import VirtualBattery, aggregate_virtual_battery
+from luxpower_can import LuxPowerCanPublisher
+from virtual_battery import VirtualBattery, VirtualBatterySettings, aggregate_virtual_battery
 
 try:
     import serial.tools.list_ports as list_ports
@@ -39,6 +40,7 @@ class BatteryMetadata:
 
     serial: str
     id: int
+    virtual_battery_disabled: bool = False
     cabinet: int | None = None
     row: int | None = None
     depth: int | None = None
@@ -57,6 +59,7 @@ class BatteryConfiguration:
     """Battery metadata indexed by the serial number reported by the BMS."""
 
     batteries_by_serial: dict[str, BatteryMetadata]
+    virtual_battery_settings: VirtualBatterySettings | None = None
 
     def find_battery(self, serial_number: object) -> BatteryMetadata | None:
         return self.batteries_by_serial.get(str(serial_number).strip())
@@ -84,6 +87,20 @@ def _require_config_integer(entry: dict[str, object], field_name: str, position:
     return value
 
 
+def _require_battery_config_number(entry: dict[str, object], field_name: str) -> float:
+    value = entry.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"virtual_battery.{field_name} must be a number.")
+    return float(value)
+
+
+def _optional_battery_config_boolean(entry: dict[str, object], field_name: str, position: int, *, default: bool) -> bool:
+    value = entry.get(field_name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"batteries[{position}].{field_name} must be a boolean when provided.")
+    return value
+
+
 def load_battery_configuration(path: str | Path = DEFAULT_BATTERY_CONFIG_PATH) -> BatteryConfiguration:
     """Load BMS metadata from the JSON configuration file used for MQTT publishing."""
     config_path = Path(path)
@@ -94,6 +111,16 @@ def load_battery_configuration(path: str | Path = DEFAULT_BATTERY_CONFIG_PATH) -
 
     if not isinstance(raw_config, dict) or not isinstance(raw_config.get("batteries"), list):
         raise ValueError(f"Battery configuration {config_path} must contain a 'batteries' list.")
+    virtual_battery = raw_config.get("virtual_battery")
+    if not isinstance(virtual_battery, dict):
+        raise ValueError(f"Battery configuration {config_path} must contain a 'virtual_battery' object.")
+    virtual_battery_settings = VirtualBatterySettings(
+        charge_voltage_limit_v=_require_battery_config_number(virtual_battery, "charge_voltage_limit_v"),
+        discharge_voltage_limit_v=_require_battery_config_number(virtual_battery, "discharge_voltage_limit_v"),
+        charge_current_limit_a=_require_battery_config_number(virtual_battery, "charge_current_limit_a"),
+        discharge_current_limit_a=_require_battery_config_number(virtual_battery, "discharge_current_limit_a"),
+        state_of_health_percent=_require_battery_config_number(virtual_battery, "state_of_health_percent"),
+    )
 
     batteries_by_serial: dict[str, BatteryMetadata] = {}
     for position, raw_battery in enumerate(raw_config["batteries"]):
@@ -112,12 +139,21 @@ def load_battery_configuration(path: str | Path = DEFAULT_BATTERY_CONFIG_PATH) -
         batteries_by_serial[serial] = BatteryMetadata(
             serial=serial,
             id=battery_id,
+            virtual_battery_disabled=_optional_battery_config_boolean(
+                raw_battery,
+                "virtual_battery_disabled",
+                position,
+                default=False,
+            ),
             cabinet=_require_config_integer(raw_battery, "cabinet", position, required=False),
             row=_require_config_integer(raw_battery, "row", position, required=False),
             depth=_require_config_integer(raw_battery, "depth", position, required=False),
         )
 
-    return BatteryConfiguration(batteries_by_serial=batteries_by_serial)
+    return BatteryConfiguration(
+        batteries_by_serial=batteries_by_serial,
+        virtual_battery_settings=virtual_battery_settings,
+    )
 
 
 def _require_config_number(entry: dict[str, object], field_name: str) -> float:
@@ -449,7 +485,7 @@ def mqtt_iterator(result: dict[str, Any], *, mqtt_client: Any, logger: logging.L
         mqtt_client,
         result,
         include_hass_discovery=mqtt_hass,
-        add_last_active_utc=False,
+        add_last_active_utc=True,
     )
 
 
@@ -539,6 +575,49 @@ def summarize_cumulative_battery_data(payloads_by_source: dict[str, dict[str, An
     return summary
 
 
+def read_bms_report_via_library(
+    port: str,
+    bms_id: int,
+    *,
+    battery_config: BatteryConfiguration,
+    safety_config: SafetyConfiguration,
+    logger: logging.Logger | None = None,
+) -> dict[str, object]:
+    """Connect to one BMS, normalize the report, and return it without publishing."""
+    logger = logger or logging.getLogger("battery_manager")
+    try:
+        from dalybms import DalyBMS
+    except ImportError as exc:  # pragma: no cover - environment-specific dependency.
+        raise RuntimeError("The dalybms Python package is required for direct BMS reporting.") from exc
+
+    bms = DalyBMS(request_retries=3, address=4, bms_id=bms_id, logger=logger)
+    try:
+        bms.connect(device=port, timeout=0.5)
+        serial_number = bms.get_serial_number()
+        if not serial_number:
+            raise RuntimeError(f"Unable to read serial number for BMS {bms_id} on {port}; MQTT identity cannot be created.")
+
+        result = bms.get_all()
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Unexpected Daly payload for BMS {bms_id}: {result!r}")
+
+        safety_result = evaluate_bms_safety(result, safety_config)
+        management_payload = build_bms_management_payload(battery_config, serial_number, safety_result)
+        if battery_config.find_battery(serial_number) is None:
+            logger.warning("No battery configuration entry found for BMS serial number %s.", serial_number)
+        _, _, topic_root = build_mqtt_device_identity(serial_number)
+        return {
+            "bms_id": bms_id,
+            "status": "ok",
+            "serial_number": serial_number,
+            "topic_root": topic_root,
+            "payload": {**result, **management_payload},
+        }
+    finally:
+        if getattr(bms, "serial", None) is not None and bms.serial.is_open:
+            bms.disconnect()
+
+
 def publish_bms_report_via_library(
     port: str,
     bms_id: int,
@@ -551,10 +630,10 @@ def publish_bms_report_via_library(
     safety_config: SafetyConfiguration,
     logger: logging.Logger | None = None,
 ) -> dict[str, object]:
-    """Connect to the serial port, read the Daly data directly, and publish it to MQTT via the library API."""
+    """Read a BMS and publish the report through the established Daly MQTT path."""
     logger = logger or logging.getLogger("battery_manager")
     try:
-        from dalybms import DalyBMS
+        from dalybms import DalyBMS, DalyBMSMQTT
         import paho.mqtt.client as paho
     except ImportError as exc:  # pragma: no cover - environment-specific dependency.
         raise RuntimeError("The dalybms and paho-mqtt Python packages are required for MQTT publishing.") from exc
@@ -565,9 +644,7 @@ def publish_bms_report_via_library(
         serial_number = bms.get_serial_number()
         if not serial_number:
             raise RuntimeError(f"Unable to read serial number for BMS {bms_id} on {port}; MQTT identity cannot be created.")
-
         device_id, device_name, topic_root = build_mqtt_device_identity(serial_number)
-
         mqtt_client = paho.Client()
         mqtt_client.username_pw_set(mqtt_user, mqtt_password)
         mqtt_client.connect(mqtt_broker, port=mqtt_port)
@@ -576,9 +653,11 @@ def publish_bms_report_via_library(
             result = bms.get_all()
             if not isinstance(result, dict):
                 raise RuntimeError(f"Unexpected Daly payload for BMS {bms_id}: {result!r}")
-
-            from dalybms import DalyBMSMQTT
-
+            safety_result = evaluate_bms_safety(result, safety_config)
+            management_payload = build_bms_management_payload(battery_config, serial_number, safety_result)
+            if battery_config.find_battery(serial_number) is None:
+                logger.warning("No battery configuration entry found for BMS serial number %s.", serial_number)
+            payload = {**result, **management_payload}
             mqtt_adapter = DalyBMSMQTT(
                 device_id=device_id,
                 device_name=device_name,
@@ -586,11 +665,6 @@ def publish_bms_report_via_library(
                 serial_number=serial_number,
                 logger=logger,
             )
-            safety_result = evaluate_bms_safety(result, safety_config)
-            management_payload = build_bms_management_payload(battery_config, serial_number, safety_result)
-            if battery_config.find_battery(serial_number) is None:
-                logger.warning("No battery configuration entry found for BMS serial number %s.", serial_number)
-            payload = {**result, **management_payload}
             mqtt_adapter.publish(
                 mqtt_client,
                 payload,
@@ -756,7 +830,7 @@ class PortMonitor:
             self.stop_event.wait(self.interval)
 
     def publish_report(self, mqtt_config: dict[str, object] | None = None) -> list[dict[str, object]]:
-        """Run the Daly library report for each discovered BMS on this port and return the results."""
+        """Read each discovered BMS and optionally publish its report to MQTT."""
         if not self.discovered:
             return []
 
@@ -764,32 +838,34 @@ class PortMonitor:
         results: list[dict[str, object]] = []
         for bms_id in self.discovered:
             try:
-                if not mqtt_enabled:
-                    self.logger.warning("MQTT publishing disabled for %s; skipping report for BMS %s", self.port, bms_id)
-                    results.append({"bms_id": bms_id, "status": "mqtt_disabled"})
-                    continue
-
-                mqtt_broker = mqtt_config.get("broker") if mqtt_config else None
-                mqtt_user = mqtt_config.get("user") if mqtt_config else None
-                mqtt_password = mqtt_config.get("password") if mqtt_config else None
-                if not mqtt_broker or not mqtt_user or not mqtt_password:
-                    raise ValueError(
-                        "MQTT publishing is enabled but broker, user, and password are required. "
-                        "Set --mqtt-broker, --mqtt-user, and --mqtt-password."
+                if mqtt_enabled:
+                    mqtt_broker = mqtt_config.get("broker") if mqtt_config else None
+                    mqtt_user = mqtt_config.get("user") if mqtt_config else None
+                    mqtt_password = mqtt_config.get("password") if mqtt_config else None
+                    if not mqtt_broker or not mqtt_user or not mqtt_password:
+                        raise ValueError(
+                            "MQTT publishing is enabled but broker, user, and password are required. "
+                            "Set --mqtt-broker, --mqtt-user, and --mqtt-password."
+                        )
+                    payload = publish_bms_report_via_library(
+                        self.port,
+                        bms_id,
+                        mqtt_broker=str(mqtt_broker),
+                        mqtt_user=str(mqtt_user),
+                        mqtt_password=str(mqtt_password),
+                        mqtt_port=int(mqtt_config.get("port", 1883)) if mqtt_config else 1883,
+                        battery_config=self.battery_config,
+                        safety_config=self.safety_config or load_safety_configuration(),
+                        logger=self.logger,
                     )
-
-                self.logger.info("Publishing report for port %s BMS %s via direct Daly library", self.port, bms_id)
-                payload = publish_bms_report_via_library(
-                    self.port,
-                    bms_id,
-                    mqtt_broker=str(mqtt_broker),
-                    mqtt_user=str(mqtt_user),
-                    mqtt_password=str(mqtt_password),
-                    mqtt_port=int(mqtt_config.get("port", 1883)) if mqtt_config else 1883,
-                    battery_config=self.battery_config,
-                    safety_config=self.safety_config or load_safety_configuration(),
-                    logger=self.logger,
-                )
+                else:
+                    payload = read_bms_report_via_library(
+                        self.port,
+                        bms_id,
+                        battery_config=self.battery_config,
+                        safety_config=self.safety_config or load_safety_configuration(),
+                        logger=self.logger,
+                    )
                 results.append({"bms_id": bms_id, "status": "ok", "payload": payload})
             except Exception as exc:  # pragma: no cover - hardware-dependent path.
                 self.logger.error("Failed to publish BMS %s on %s: %s", bms_id, self.port, exc)
@@ -839,11 +915,21 @@ class PortRegistry:
         self.bms_payloads: dict[str, dict[str, Any]] = {}
         self._payload_lock = threading.RLock()
         self._mqtt_config: dict[str, object] | None = None
+        self._can_publisher: LuxPowerCanPublisher | None = None
+        self._full_charge_cutoff_active = False
+        self._empty_discharge_cutoff_active = False
         self.excluded_ports = tuple(excluded_ports or ())
         self.excluded_port_ids = tuple(excluded_port_ids or ())
         self.excluded_patterns = tuple(excluded_patterns or DEFAULT_EXCLUDED_PORT_PATTERNS)
 
-    def record_bms_payload(self, source: str, payload: dict[str, Any]) -> None:
+    def record_bms_payload(self, source: str, payload: dict[str, Any], *, serial_number: object | None = None) -> None:
+        """Store a BMS report when its configured virtual-battery flag permits it."""
+        battery = self.battery_config.find_battery(serial_number) if serial_number is not None else None
+        if battery is not None and battery.virtual_battery_disabled:
+            self.logger.debug("Excluding disabled battery %s from virtual battery aggregation.", battery.serial)
+            with self._payload_lock:
+                self.bms_payloads.pop(source, None)
+            return
         with self._payload_lock:
             self.bms_payloads[source] = payload
 
@@ -854,7 +940,35 @@ class PortRegistry:
     def virtual_battery(self) -> VirtualBattery:
         """Return the current aggregate of BMS reports with full rack metadata."""
         with self._payload_lock:
-            return aggregate_virtual_battery(self.bms_payloads.values())
+            return aggregate_virtual_battery(
+                self.bms_payloads.values(),
+                settings=self.battery_config.virtual_battery_settings,
+            )
+
+    def process_virtual_battery_safety(self, battery: VirtualBattery) -> None:
+        """Apply one-shot effects when the aggregate reaches either voltage limit."""
+        if battery.full_charge_cutoff and not self._full_charge_cutoff_active:
+            self.set_all_bms_state_of_charge_to_100()
+        if battery.empty_discharge_cutoff and not self._empty_discharge_cutoff_active:
+            self.set_all_bms_state_of_charge_to_0()
+        self._full_charge_cutoff_active = battery.full_charge_cutoff
+        self._empty_discharge_cutoff_active = battery.empty_discharge_cutoff
+
+    def set_all_bms_state_of_charge_to_100(self) -> None:
+        """Set every contributing BMS's SoC after the full-charge voltage cutoff.
+
+        TODO: Send the Daly command that persists 100% SoC to each contributing
+        BMS. This intentionally remains a no-op until that write operation is
+        implemented and hardware-tested.
+        """
+
+    def set_all_bms_state_of_charge_to_0(self) -> None:
+        """Set every contributing BMS's SoC after the low-voltage cutoff.
+
+        TODO: Send the Daly command that persists 0% SoC to each contributing
+        BMS. This intentionally remains a no-op until that write operation is
+        implemented and hardware-tested.
+        """
 
     def add_port(self, port: str, bitmask: int = DEFAULT_DISCOVER_MASK, timeout: int = 60, interval: int = 15) -> PortMonitor:
         if is_excluded_port(
@@ -877,8 +991,8 @@ class PortRegistry:
             )
             self.monitors[port] = monitor
             monitor.start()
-            if self._mqtt_config is not None:
-                monitor.on_update = _make_mqtt_update_callback(monitor, self, self._mqtt_config)
+            if self._mqtt_config is not None or self._can_publisher is not None:
+                monitor.on_update = _make_mqtt_update_callback(monitor, self, self._mqtt_config, self._can_publisher)
         return self.monitors[port]
 
     def refresh_ports(
@@ -906,9 +1020,9 @@ class PortRegistry:
             monitor = self.monitors.pop(port)
             monitor.stop()
 
-        if self._mqtt_config is not None:
+        if self._mqtt_config is not None or self._can_publisher is not None:
             for monitor in self.monitors.values():
-                monitor.on_update = _make_mqtt_update_callback(monitor, self, self._mqtt_config)
+                monitor.on_update = _make_mqtt_update_callback(monitor, self, self._mqtt_config, self._can_publisher)
 
         return set(self.monitors)
 
@@ -941,6 +1055,8 @@ class PortRegistry:
         ]
         if mqtt_status is not None:
             lines.append(mqtt_status)
+        if self._can_publisher is not None:
+            lines.append(self._can_publisher.status_summary())
         summary = self.cumulative_battery_summary()
         lines.append("Cumulative Battery Data")
         lines.append(f"  Sources: {summary.get('sources', 0)}   Voltage summaries: {summary.get('voltage_summaries', 0)}")
@@ -970,31 +1086,41 @@ def _make_mqtt_update_callback(
     monitor: PortMonitor,
     registry: PortRegistry,
     mqtt_config: dict[str, object] | None,
+    can_publisher: LuxPowerCanPublisher | None = None,
 ) -> Callable[[], None]:
     def on_update() -> None:
-        if not mqtt_config:
-            return
-        mqtt_ready = bool(mqtt_config.get("enabled", True))
-        if not mqtt_ready:
-            return
         if not monitor.discovered:
             return
-        mqtt_cfg_for_call = {
-            "enabled": True,
-            "broker": mqtt_config.get("broker"),
-            "user": mqtt_config.get("user"),
-            "password": mqtt_config.get("password"),
-            "port": mqtt_config.get("port", 1883),
-        }
+        mqtt_ready = bool(mqtt_config and mqtt_config.get("enabled", True))
+        mqtt_cfg_for_call = None
+        if mqtt_ready and mqtt_config is not None:
+            mqtt_cfg_for_call = {
+                "enabled": True,
+                "broker": mqtt_config.get("broker"),
+                "user": mqtt_config.get("user"),
+                "password": mqtt_config.get("password"),
+                "port": mqtt_config.get("port", 1883),
+            }
         publish_results = monitor.publish_report(mqtt_cfg_for_call) or []
         for result in publish_results:
-            payload = result.get("payload")
-            if isinstance(payload, dict) and isinstance(payload.get("payload"), dict):
-                payload = payload["payload"]
+            report = result.get("payload")
+            serial_number = report.get("serial_number") if isinstance(report, dict) else None
+            payload = report
+            if isinstance(report, dict) and isinstance(report.get("payload"), dict):
+                payload = report["payload"]
             bms_id = result.get("bms_id")
             if isinstance(payload, dict) and bms_id is not None:
-                registry.record_bms_payload(f"{monitor.port}:{bms_id}", payload)
+                registry.record_bms_payload(
+                    f"{monitor.port}:{bms_id}",
+                    payload,
+                    serial_number=serial_number,
+                )
         virtual_battery = registry.virtual_battery()
+        registry.process_virtual_battery_safety(virtual_battery)
+        if can_publisher is not None:
+            can_publisher.update(virtual_battery)
+        if not mqtt_ready or mqtt_cfg_for_call is None:
+            return
         try:
             publish_virtual_battery_via_library(
                 virtual_battery,
@@ -1010,14 +1136,19 @@ def _make_mqtt_update_callback(
     return on_update
 
 
-def bind_dashboard_monitor_updates(registry: PortRegistry, mqtt_config: dict[str, object] | None = None) -> None:
-    """Attach each monitor update callback to MQTT publication when MQTT credentials are available."""
+def bind_dashboard_monitor_updates(
+    registry: PortRegistry,
+    mqtt_config: dict[str, object] | None = None,
+    can_publisher: LuxPowerCanPublisher | None = None,
+) -> None:
+    """Attach each monitor update callback to optional MQTT and LuxPower CAN publication."""
     registry._mqtt_config = mqtt_config
+    registry._can_publisher = can_publisher
     if not registry.monitors:
         return
 
     for monitor in registry.monitors.values():
-        monitor.on_update = _make_mqtt_update_callback(monitor, registry, mqtt_config)
+        monitor.on_update = _make_mqtt_update_callback(monitor, registry, mqtt_config, can_publisher)
 
 
 def get_missing_mqtt_fields(mqtt_broker: str | None, mqtt_user: str | None, mqtt_password: str | None) -> list[str]:
@@ -1112,6 +1243,18 @@ def main() -> int:
         help="Seconds between each port's discovery scan while the monitor is running.",
     )
     parser.add_argument(
+        "--can-port",
+        type=str,
+        default=None,
+        help="LuxPower CAN port: SocketCAN interface (for example can0) or Waveshare USB-CAN-A serial device (for example /dev/ttyUSB1).",
+    )
+    parser.add_argument(
+        "--can-bitrate",
+        type=int,
+        default=500_000,
+        help="CAN bitrate for a Waveshare USB-CAN-A serial device; defaults to 500000.",
+    )
+    parser.add_argument(
         "--dashboard",
         action="store_true",
         help="Render a persistent terminal dashboard instead of a one-time JSON dump.",
@@ -1178,8 +1321,11 @@ def main() -> int:
     except ValueError as exc:
         parser.error(f"Invalid bitmask: {args.bitmask!r} ({exc})")
 
-    excluded_ports = list(dict.fromkeys(args.exclude_port or []))
-    excluded_port_ids = list(dict.fromkeys(args.exclude_port_id or []))
+    configured_excluded_ports: list[str] = [str(port) for port in args.exclude_port]
+    if args.can_port:
+        configured_excluded_ports.append(str(args.can_port))
+    excluded_ports: list[str] = list(dict.fromkeys(configured_excluded_ports))
+    excluded_port_ids: list[str] = list(dict.fromkeys(str(port_id) for port_id in args.exclude_port_id))
     ports = args.port or enumerate_serial_ports(
         excluded_ports=excluded_ports,
         excluded_port_ids=excluded_port_ids,
@@ -1218,6 +1364,14 @@ def main() -> int:
             ", ".join(missing_mqtt_fields),
         )
 
+    can_publisher = None
+    if args.can_port:
+        try:
+            can_publisher = LuxPowerCanPublisher(args.can_port, bitrate=args.can_bitrate, logger=logger)
+        except (RuntimeError, ValueError) as exc:
+            parser.error(str(exc))
+        logger.info("Enabled LuxPower CAN output on %s", args.can_port)
+
     if args.dashboard:
         try:
             mqtt_config = None
@@ -1229,19 +1383,22 @@ def main() -> int:
                     "password": args.mqtt_password,
                     "port": 1883,
                 }
-            bind_dashboard_monitor_updates(registry, mqtt_config)
+            bind_dashboard_monitor_updates(registry, mqtt_config, can_publisher)
             registry.start_all()
             run_dashboard(registry, refresh_seconds=1.0, mqtt_status=mqtt_status)
         except KeyboardInterrupt:
             logger.info("Dashboard shutdown requested; stopping all monitors.")
         finally:
             registry.stop_all()
+            if can_publisher is not None:
+                can_publisher.close()
         return 0
 
     discovered = discover_all_ports(bitmask=bitmask, ports=ports, timeout=args.timeout, logger=logger)
 
-    if not missing_mqtt_fields:
-        logger.info("Publishing to MQTT broker %s for each discovered BMS", args.mqtt_broker)
+    if not missing_mqtt_fields or can_publisher is not None:
+        if not missing_mqtt_fields:
+            logger.info("Publishing to MQTT broker %s for each discovered BMS", args.mqtt_broker)
         for port, found in discovered.items():
             monitor = registry.monitors.get(port)
             if monitor is None:
@@ -1256,16 +1413,36 @@ def main() -> int:
                 )
                 monitor.discovered = found
                 registry.monitors[port] = monitor
-            mqtt_config = {
+            mqtt_config = None if missing_mqtt_fields else {
                 "enabled": True,
                 "broker": args.mqtt_broker,
                 "user": args.mqtt_user,
                 "password": args.mqtt_password,
             }
-            monitor.publish_report(mqtt_config)
+            for result in monitor.publish_report(mqtt_config):
+                report = result.get("payload")
+                serial_number = report.get("serial_number") if isinstance(report, dict) else None
+                payload = report
+                if isinstance(report, dict) and isinstance(report.get("payload"), dict):
+                    payload = report["payload"]
+                bms_id = result.get("bms_id")
+                if isinstance(payload, dict) and bms_id is not None:
+                    registry.record_bms_payload(
+                        f"{port}:{bms_id}",
+                        payload,
+                        serial_number=serial_number,
+                    )
+        virtual_battery = registry.virtual_battery()
+        registry.process_virtual_battery_safety(virtual_battery)
+        if can_publisher is not None:
+            can_publisher.update(virtual_battery)
 
-    print(json.dumps(discovered, indent=2, sort_keys=True))
-    return 0
+    try:
+        print(json.dumps(discovered, indent=2, sort_keys=True))
+        return 0
+    finally:
+        if can_publisher is not None:
+            can_publisher.close()
 
 
 if __name__ == "__main__":
