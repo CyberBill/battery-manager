@@ -127,10 +127,12 @@ def aggregate_virtual_battery(
 ) -> VirtualBattery:
     """Combine BMS reports having complete rack-location metadata.
 
-    Voltage, state of charge, and temperatures are averaged across the parallel
-    members. Current, rated capacity, and remaining capacity are summed. The most
-    restrictive cell readings and enabled flags are retained. Charge/discharge
-    voltage/current limits and state of health come from the rack configuration.
+    Voltage and temperatures are averaged across the parallel members. State of
+    charge is averaged unless any member reports full, in which case it is
+    reported as 100%. Current, rated capacity, and remaining capacity are summed.
+    The most restrictive cell readings and enabled flags are retained.
+    Charge/discharge voltage/current limits and state of health come from the rack
+    configuration.
     """
     configured_payloads = [payload for payload in payloads if _valid_member(payload)]
     complete_payloads = [
@@ -181,6 +183,7 @@ def aggregate_virtual_battery(
         and pack_voltage_v is not None
         and pack_voltage_v <= settings.discharge_voltage_limit_v
     )
+    member_reports_full = any(value >= 100.0 for value in present(state_of_charge))
 
     return VirtualBattery(
         identifier=identifier,
@@ -195,7 +198,7 @@ def aggregate_virtual_battery(
         pack_voltage_v=pack_voltage_v,
         pack_current_a=_sum(present(pack_currents)),
         state_of_charge_percent=(
-            100.0 if full_charge_cutoff
+            100.0 if full_charge_cutoff or member_reports_full
             else 0.0 if empty_discharge_cutoff
             else _mean(present(state_of_charge))
         ),

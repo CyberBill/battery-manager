@@ -63,11 +63,19 @@
         },
         {
             "serial": "221KL280200307",
-            "id": 9
+            "id": 9,
+            "virtual_battery_disabled": true,
+            "cabinet": 2,
+            "row": 2,
+            "depth": 2
         },
         {
             "serial": "221KL280200093",
-            "id": 10
+            "id": 10,
+            "virtual_battery_disabled": true,
+            "cabinet": 2,
+            "row": 2,
+            "depth": 1
         },
         {
             "serial": "221KL280200308",

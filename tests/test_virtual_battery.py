@@ -75,6 +75,19 @@ class VirtualBatteryTests(unittest.TestCase):
             "  Charge enabled: True (100.0 A)   Discharge enabled: True (100.0 A)",
         )
 
+    def test_aggregate_reports_full_when_any_bms_reports_full(self):
+        full = bms_payload(soc={"total_voltage": 48.5, "current": -2.0, "soc_percent": 100.0})
+        partially_charged = bms_payload(
+            id=2,
+            depth=2,
+            soc={"total_voltage": 48.4, "current": -3.0, "soc_percent": 45.0},
+        )
+
+        virtual = aggregate_virtual_battery([full, partially_charged], settings=VIRTUAL_BATTERY_SETTINGS)
+
+        self.assertFalse(virtual.full_charge_cutoff)
+        self.assertEqual(virtual.state_of_charge_percent, 100.0)
+
     def test_aggregate_stops_charging_and_reports_full_when_voltage_reaches_limit(self):
         full = bms_payload(soc={"total_voltage": 49.8, "current": 2.0, "soc_percent": 94.0})
 
