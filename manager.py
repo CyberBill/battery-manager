@@ -64,6 +64,13 @@ class BatteryConfiguration:
     def find_battery(self, serial_number: object) -> BatteryMetadata | None:
         return self.batteries_by_serial.get(str(serial_number).strip())
 
+    def find_battery_by_id(self, bms_id: int | str | object) -> BatteryMetadata | None:
+        target_id = int(bms_id)
+        for battery in self.batteries_by_serial.values():
+            if battery.id == target_id:
+                return battery
+        return None
+
 
 @dataclass(frozen=True)
 class SafetyConfiguration:
@@ -404,9 +411,19 @@ def build_bms_management_payload(
     battery_config: BatteryConfiguration,
     serial_number: object,
     safety_result: tuple[bool, str],
+    *,
+    bms_id: int | None = None,
 ) -> dict[str, object]:
-    """Return configured metadata, safety state, and Home Assistant unknown values."""
+    """Return configured metadata, safety state, and Home Assistant unknown values.
+
+    If a serial-number lookup misses, fall back to the configured BMS ID so the
+    physical slot still publishes the cabinet/row/depth metadata even when the
+    underlying library cannot resolve the serial number.
+    """
     battery = battery_config.find_battery(serial_number)
+    if battery is None and bms_id is not None:
+        battery = battery_config.find_battery_by_id(bms_id)
+
     payload: dict[str, object] = {
         "id": "None",
         "cabinet": "None",
@@ -602,10 +619,16 @@ def read_bms_report_via_library(
             raise RuntimeError(f"Unexpected Daly payload for BMS {bms_id}: {result!r}")
 
         safety_result = evaluate_bms_safety(result, safety_config)
-        management_payload = build_bms_management_payload(battery_config, serial_number, safety_result)
-        if battery_config.find_battery(serial_number) is None:
-            logger.warning("No battery configuration entry found for BMS serial number %s.", serial_number)
-        _, _, topic_root = build_mqtt_device_identity(serial_number)
+        configured_battery = battery_config.find_battery(serial_number) or battery_config.find_battery_by_id(bms_id)
+        mqtt_serial = configured_battery.serial if configured_battery is not None else serial_number
+        management_payload = build_bms_management_payload(
+            battery_config,
+            mqtt_serial,
+            safety_result,
+        )
+        if configured_battery is None:
+            logger.warning("No battery configuration entry found for BMS serial number %s; using BMS ID %s metadata fallback.", serial_number, bms_id)
+        _, _, topic_root = build_mqtt_device_identity(mqtt_serial)
         return {
             "bms_id": bms_id,
             "status": "ok",
@@ -644,7 +667,9 @@ def publish_bms_report_via_library(
         serial_number = bms.get_serial_number()
         if not serial_number:
             raise RuntimeError(f"Unable to read serial number for BMS {bms_id} on {port}; MQTT identity cannot be created.")
-        device_id, device_name, topic_root = build_mqtt_device_identity(serial_number)
+        configured_battery = battery_config.find_battery(serial_number) or battery_config.find_battery_by_id(bms_id)
+        mqtt_serial = configured_battery.serial if configured_battery is not None else serial_number
+        device_id, device_name, topic_root = build_mqtt_device_identity(mqtt_serial)
         mqtt_client = paho.Client()
         mqtt_client.username_pw_set(mqtt_user, mqtt_password)
         mqtt_client.connect(mqtt_broker, port=mqtt_port)
@@ -654,15 +679,19 @@ def publish_bms_report_via_library(
             if not isinstance(result, dict):
                 raise RuntimeError(f"Unexpected Daly payload for BMS {bms_id}: {result!r}")
             safety_result = evaluate_bms_safety(result, safety_config)
-            management_payload = build_bms_management_payload(battery_config, serial_number, safety_result)
-            if battery_config.find_battery(serial_number) is None:
-                logger.warning("No battery configuration entry found for BMS serial number %s.", serial_number)
+            management_payload = build_bms_management_payload(
+                battery_config,
+                mqtt_serial,
+                safety_result,
+            )
+            if configured_battery is None:
+                logger.warning("No battery configuration entry found for BMS serial number %s; using BMS ID %s metadata fallback.", serial_number, bms_id)
             payload = {**result, **management_payload}
             mqtt_adapter = DalyBMSMQTT(
                 device_id=device_id,
                 device_name=device_name,
                 topic_root=topic_root,
-                serial_number=serial_number,
+                serial_number=mqtt_serial,
                 logger=logger,
             )
             mqtt_adapter.publish(
@@ -945,6 +974,51 @@ class PortRegistry:
                 settings=self.battery_config.virtual_battery_settings,
             )
 
+    def publish_configured_bms_metadata(self, mqtt_config: dict[str, object] | None = None) -> None:
+        """Publish each configured battery's metadata once at startup.
+
+        The cabinet/row/depth data is static configuration and does not need to be re-evaluated on
+        every discovery cycle. Publishing the configured metadata once on startup ensures Home
+        Assistant keeps the stable serial-based identity and location data even when a BMS is offline
+        or not connected at the time the program launches.
+        """
+        if not mqtt_config or not bool(mqtt_config.get("enabled", True)):
+            return
+
+        try:
+            import paho.mqtt.client as paho
+        except ImportError as exc:  # pragma: no cover - environment-specific dependency.
+            raise RuntimeError("The paho-mqtt Python package is required for MQTT publishing.") from exc
+
+        for battery in sorted(self.battery_config.batteries_by_serial.values(), key=lambda item: item.id):
+            result = {
+                "id": battery.id,
+                "cabinet": battery.cabinet if battery.cabinet is not None else "None",
+                "row": battery.row if battery.row is not None else "None",
+                "depth": battery.depth if battery.depth is not None else "None",
+                "safe": False,
+                "safety_reason": "Configuration metadata published at startup",
+            }
+            device_id, device_name, topic_root = build_mqtt_device_identity(battery.serial)
+            mqtt_client = paho.Client()
+            mqtt_client.username_pw_set(str(mqtt_config.get("user")), str(mqtt_config.get("password")))
+            mqtt_client.connect(str(mqtt_config.get("broker")), port=int(mqtt_config.get("port", 1883)))
+            mqtt_client.loop_start()
+            try:
+                mqtt_iterator(
+                    result,
+                    mqtt_client=mqtt_client,
+                    logger=self.logger,
+                    topic_root=topic_root,
+                    device_id=device_id,
+                    device_name=device_name,
+                    serial_number=battery.serial,
+                    mqtt_hass=True,
+                )
+            finally:
+                mqtt_client.disconnect()
+                mqtt_client.loop_stop()
+
     def process_virtual_battery_safety(self, battery: VirtualBattery) -> None:
         """Apply one-shot effects when the aggregate reaches either voltage limit."""
         if battery.full_charge_cutoff and not self._full_charge_cutoff_active:
@@ -1089,8 +1163,6 @@ def _make_mqtt_update_callback(
     can_publisher: LuxPowerCanPublisher | None = None,
 ) -> Callable[[], None]:
     def on_update() -> None:
-        if not monitor.discovered:
-            return
         mqtt_ready = bool(mqtt_config and mqtt_config.get("enabled", True))
         mqtt_cfg_for_call = None
         if mqtt_ready and mqtt_config is not None:
@@ -1383,6 +1455,7 @@ def main() -> int:
                     "password": args.mqtt_password,
                     "port": 1883,
                 }
+                registry.publish_configured_bms_metadata(mqtt_config)
             bind_dashboard_monitor_updates(registry, mqtt_config, can_publisher)
             registry.start_all()
             run_dashboard(registry, refresh_seconds=1.0, mqtt_status=mqtt_status)
@@ -1398,7 +1471,14 @@ def main() -> int:
 
     if not missing_mqtt_fields or can_publisher is not None:
         if not missing_mqtt_fields:
-            logger.info("Publishing to MQTT broker %s for each discovered BMS", args.mqtt_broker)
+            logger.info("Publishing configured battery metadata to MQTT broker %s on startup", args.mqtt_broker)
+            registry.publish_configured_bms_metadata({
+                "enabled": True,
+                "broker": args.mqtt_broker,
+                "user": args.mqtt_user,
+                "password": args.mqtt_password,
+                "port": 1883,
+            })
         for port, found in discovered.items():
             monitor = registry.monitors.get(port)
             if monitor is None:

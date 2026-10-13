@@ -9,173 +9,185 @@
     "batteries": [
         {
             "serial": "221KL280200318",
-            "virtual_battery_disabled": true,
             "id": 1,
-            "cabinet": 1,
-            "row": 2,
+            "cabinet": 5,
+            "row": 3,
             "depth": 2
         },
         {
             "serial": "221KL280200305",
-            "virtual_battery_disabled": true,
             "id": 2,
-            "cabinet": 1,
-            "row": 2,
+            "cabinet": 5,
+            "row": 3,
             "depth": 1
         },
         {
             "serial": "221KL280200301",
-            "virtual_battery_disabled": true,
             "id": 3,
-            "cabinet": 1,
-            "row": 3,
+            "cabinet": 5,
+            "row": 2,
             "depth": 2
         },
         {
             "serial": "221KL280200344",
-            "virtual_battery_disabled": true,
             "id": 4,
-            "cabinet": 1,
-            "row": 3,
+            "cabinet": 5,
+            "row": 2,
             "depth": 1
         },
         {
             "serial": "221KL280200096",
             "id": 5,
             "cabinet": 5,
-            "row": 2,
+            "row": 1,
             "depth": 2
         },
         {
             "serial": "221KL280200092",
             "id": 6,
             "cabinet": 5,
-            "row": 2,
+            "row": 1,
             "depth": 1
         },
         {
             "serial": "221KL280200089",
-            "id": 7
+            "id": 7,
+            "virtual_battery_disabled": true
         },
         {
             "serial": "221KL280200317",
-            "id": 8
+            "id": 8,
+            "virtual_battery_disabled": true
         },
         {
             "serial": "221KL280200307",
             "id": 9,
-            "virtual_battery_disabled": true,
-            "cabinet": 2,
+            "cabinet": 4,
             "row": 2,
             "depth": 2
         },
         {
             "serial": "221KL280200093",
             "id": 10,
-            "virtual_battery_disabled": true,
-            "cabinet": 2,
+            "cabinet": 4,
             "row": 2,
             "depth": 1
         },
         {
             "serial": "221KL280200308",
             "id": 11,
-            "cabinet": 5,
+            "cabinet": 4,
             "row": 1,
             "depth": 2
         },
         {
             "serial": "221KL280200302",
             "id": 12,
-            "cabinet": 5,
+            "cabinet": 4,
             "row": 1,
             "depth": 1
         },
         {
             "serial": "221KL280200341",
             "id": 13,
-            "cabinet": 5,
-            "row": 3,
+            "cabinet": 3,
+            "row": 2,
             "depth": 2
         },
         {
             "serial": "221KL280200306",
             "id": 14,
-            "cabinet": 5,
-            "row": 3,
+            "cabinet": 3,
+            "row": 2,
             "depth": 1
         },
         {
             "serial": "221KL280200090",
-            "virtual_battery_disabled": true,
             "id": 15,
-            "cabinet": 1,
+            "cabinet": 3,
             "row": 1,
             "depth": 2
         },
         {
             "serial": "221KL280200095",
-            "virtual_battery_disabled": true,
             "id": 16,
-            "cabinet": 1,
+            "cabinet": 3,
             "row": 1,
             "depth": 1
         },
         {
             "serial": "221KL280200078",
-            "id": 17
+            "id": 17,
+            "virtual_battery_disabled": true
         },
         {
             "serial": "221KL280200304",
-            "id": 18
+            "id": 18,
+            "virtual_battery_disabled": true
         },
         {
             "serial": "221KL280200091",
-            "id": 19
+            "id": 19,
+            "cabinet": 2,
+            "row": 2,
+            "depth": 2
         },
         {
             "serial": "221KL280200080",
-            "id": 20
+            "id": 20,
+            "cabinet": 2,
+            "row": 2,
+            "depth": 1
         },
         {
             "serial": "221KL280200082",
-            "id": 21
+            "id": 21,
+            "cabinet": 2,
+            "row": 1,
+            "depth": 2
         },
         {
             "serial": "221KL280200343",
-            "id": 22
+            "id": 22,
+            "cabinet": 2,
+            "row": 1,
+            "depth": 1
         },
         {
             "serial": "221KL280200320",
-            "id": 23
+            "id": 23,
+            "virtual_battery_disabled": true
         },
         {
             "serial": "221KL280200094",
-            "id": 24
+            "id": 24,
+            "virtual_battery_disabled": true
         },
         {
             "serial": "221KL280200079",
             "virtual_battery_disabled": true,
             "id": 25,
-            "cabinet": 2,
-            "row": 1,
+            "cabinet": 1,
+            "row": 2,
             "depth": 2
         },
         {
             "serial": "221KL280200303",
             "virtual_battery_disabled": true,
             "id": 26,
-            "cabinet": 2,
-            "row": 1,
+            "cabinet": 1,
+            "row": 2,
             "depth": 1
         },
         {
             "serial": "221KL280200083",
-            "id": 27
+            "id": 27,
+            "virtual_battery_disabled": true
         },
         {
             "serial": "221KL280200077",
-            "id": 28
+            "id": 28,
+            "virtual_battery_disabled": true
         }
     ]
 }

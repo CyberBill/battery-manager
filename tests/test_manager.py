@@ -1,4 +1,7 @@
 import json
+import logging
+import sys
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -24,6 +27,7 @@ from manager import (
     load_safety_configuration,
     mqtt_iterator,
     parse_discover_output,
+    publish_bms_report_via_library,
     should_quit_dashboard_key,
 )
 
@@ -295,6 +299,52 @@ Found 2 BMS devices.
         self.assertTrue(created)
         self.assertEqual(created[0].name, "battery_manager.discovery_probe")
 
+    def test_configured_bms_metadata_is_published_once_at_startup(self):
+        battery_config = load_battery_configuration(Path(__file__).parent.parent / "battery-config.json")
+        registry = PortRegistry(battery_config=battery_config)
+        mqtt_config = {
+            "enabled": True,
+            "broker": "homeassistant",
+            "user": "daly",
+            "password": "secret",
+        }
+
+        fake_paho = types.ModuleType("paho")
+        fake_paho_mqtt = types.ModuleType("paho.mqtt")
+        fake_paho_client = types.ModuleType("paho.mqtt.client")
+
+        class FakeClient:
+            def username_pw_set(self, *args, **kwargs):
+                return None
+
+            def connect(self, *args, **kwargs):
+                return None
+
+            def loop_start(self):
+                return None
+
+            def disconnect(self):
+                return None
+
+            def loop_stop(self):
+                return None
+
+        fake_paho_client.Client = FakeClient
+        fake_paho.mqtt = fake_paho_mqtt
+        fake_paho_mqtt.client = fake_paho_client
+
+        with patch("manager.mqtt_iterator") as mqtt_iterator_mock, patch.dict(sys.modules, {"paho": fake_paho, "paho.mqtt": fake_paho_mqtt, "paho.mqtt.client": fake_paho_client}):
+            registry.publish_configured_bms_metadata(mqtt_config)
+
+        self.assertTrue(any(
+            call.kwargs["serial_number"] == "221KL280200303"
+            and call.args[0]["id"] == 26
+            and call.args[0]["cabinet"] == 1
+            and call.args[0]["row"] == 2
+            and call.args[0]["depth"] == 1
+            for call in mqtt_iterator_mock.call_args_list
+        ))
+
     def test_dashboard_monitor_updates_publish_when_mqtt_enabled(self):
         registry = PortRegistry(battery_config=self.battery_config())
         registry.add_port("/dev/ttyACM0")
@@ -412,8 +462,8 @@ Found 2 BMS devices.
         self.assertIsNotNone(battery)
         assert battery is not None
         self.assertEqual(battery.id, 1)
-        self.assertEqual(battery.cabinet, 1)
-        self.assertEqual(battery.row, 2)
+        self.assertEqual(battery.cabinet, 5)
+        self.assertEqual(battery.row, 3)
         self.assertEqual(battery.depth, 2)
         assert battery_config.virtual_battery_settings is not None
         self.assertEqual(battery_config.virtual_battery_settings.charge_voltage_limit_v, 49.8)
@@ -467,8 +517,23 @@ Found 2 BMS devices.
             build_bms_management_payload(battery_config, "221KL280200318", (True, "OK")),
             {
                 "id": 1,
-                "cabinet": 1,
-                "row": 2,
+                "cabinet": 5,
+                "row": 3,
+                "depth": 2,
+                "safe": True,
+                "safety_reason": "OK",
+            },
+        )
+
+    def test_management_payload_falls_back_to_battery_id_when_serial_not_found(self):
+        battery_config = load_battery_configuration(Path(__file__).parent.parent / "battery-config.json")
+
+        self.assertEqual(
+            build_bms_management_payload(battery_config, "unknown-serial", (True, "OK"), bms_id=1),
+            {
+                "id": 1,
+                "cabinet": 5,
+                "row": 3,
                 "depth": 2,
                 "safe": True,
                 "safety_reason": "OK",
@@ -500,6 +565,90 @@ Found 2 BMS devices.
                 "safety_reason": "OK",
             },
         )
+
+    def test_publish_bms_report_via_library_uses_configured_serial_topic_when_runtime_serial_missing(self):
+        captured = {}
+
+        class FakeSerial:
+            def __init__(self):
+                self.is_open = True
+
+        class FakeDalyBMS:
+            def __init__(self, request_retries, address, bms_id, logger):
+                self.serial = FakeSerial()
+                self.bms_id = bms_id
+
+            def connect(self, device, timeout=None):
+                return None
+
+            def get_serial_number(self):
+                return "stale-serial-123"
+
+            def get_all(self):
+                return {
+                    "temperature_range": {"highest_temperature": 30},
+                    "cell_voltage_range": {"highest_voltage": 3.80, "lowest_voltage": 3.60},
+                    "soc": {"total_voltage": 48.0},
+                }
+
+            def disconnect(self):
+                self.serial.is_open = False
+
+        class FakeDalyBMSMQTT:
+            def __init__(self, **kwargs):
+                captured["topic_root"] = kwargs["topic_root"]
+                captured["serial_number"] = kwargs["serial_number"]
+                captured["device_id"] = kwargs["device_id"]
+
+            def publish(self, mqtt_client, payload, include_hass_discovery=True, add_last_active_utc=True):
+                captured["payload"] = payload
+
+        class FakeClient:
+            def username_pw_set(self, *args, **kwargs):
+                return None
+
+            def connect(self, *args, **kwargs):
+                return None
+
+            def loop_start(self):
+                return None
+
+            def disconnect(self):
+                return None
+
+            def loop_stop(self):
+                return None
+
+        battery_config = load_battery_configuration(Path(__file__).parent.parent / "battery-config.json")
+
+        fake_dalybms = types.ModuleType("dalybms")
+        fake_dalybms.DalyBMS = FakeDalyBMS
+        fake_dalybms.DalyBMSMQTT = FakeDalyBMSMQTT
+
+        fake_paho = types.ModuleType("paho")
+        fake_paho_mqtt = types.ModuleType("paho.mqtt")
+        fake_paho_client = types.ModuleType("paho.mqtt.client")
+        fake_paho_client.Client = FakeClient
+        fake_paho.mqtt = fake_paho_mqtt
+        fake_paho_mqtt.client = fake_paho_client
+
+        with patch.dict(sys.modules, {"dalybms": fake_dalybms, "paho": fake_paho, "paho.mqtt": fake_paho_mqtt, "paho.mqtt.client": fake_paho_client}):
+            publish_bms_report_via_library(
+                "/dev/ttyUSB0",
+                26,
+                mqtt_broker="broker",
+                mqtt_user="user",
+                mqtt_password="secret",
+                battery_config=battery_config,
+                safety_config=self.safety_config(),
+                logger=logging.getLogger("battery_manager.test"),
+            )
+
+        self.assertEqual(captured["serial_number"], "221KL280200303")
+        self.assertEqual(captured["topic_root"], "battery/daly/221KL280200303")
+        self.assertEqual(captured["payload"]["cabinet"], 1)
+        self.assertEqual(captured["payload"]["row"], 2)
+        self.assertEqual(captured["payload"]["depth"], 1)
 
     def test_load_safety_configuration_and_evaluate_bms_safety(self):
         safety_config = load_safety_configuration(Path(__file__).parent.parent / "safety-config.json")
