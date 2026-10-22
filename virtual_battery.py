@@ -20,8 +20,10 @@ class VirtualBatterySettings:
 
     charge_voltage_limit_v: float
     discharge_voltage_limit_v: float
-    charge_current_limit_a: float
-    discharge_current_limit_a: float
+    current_limit_a: float
+    charge_current_per_bms_a: float | None = None
+    discharge_current_per_bms_a: float | None = None
+    current_per_cabinet_a: float | None = None
     state_of_health_percent: float = 100.0
 
 
@@ -119,6 +121,22 @@ def _sum(values: Iterable[float]) -> float | None:
     return sum(values) if values else None
 
 
+def _effective_current_limit(
+    *,
+    member_count: int,
+    cabinet_count: int,
+    array_limit_a: float,
+    per_bms_limit_a: float | None,
+    per_cabinet_limit_a: float | None,
+) -> float:
+    limits = [array_limit_a]
+    if per_bms_limit_a is not None:
+        limits.append(per_bms_limit_a * member_count)
+    if per_cabinet_limit_a is not None:
+        limits.append(per_cabinet_limit_a * cabinet_count)
+    return min(limits)
+
+
 def aggregate_virtual_battery(
     payloads: Iterable[dict[str, Any]],
     *,
@@ -172,6 +190,7 @@ def aggregate_virtual_battery(
     ]
     charge_enabled = complete_safe and bool(charging_mosfets) and all(value is True for value in charging_mosfets)
     discharge_enabled = complete_safe and bool(discharging_mosfets) and all(value is True for value in discharging_mosfets)
+    cabinet_count = len({payload.get("cabinet") for payload in complete_payloads if isinstance(payload.get("cabinet"), int)})
     pack_voltage_v = _mean(present(pack_voltages))
     full_charge_cutoff = (
         settings is not None
@@ -184,6 +203,23 @@ def aggregate_virtual_battery(
         and pack_voltage_v <= settings.discharge_voltage_limit_v
     )
     member_reports_full = any(value >= 100.0 for value in present(state_of_charge))
+    charge_current_limit_a = None
+    discharge_current_limit_a = None
+    if settings is not None:
+        charge_current_limit_a = _effective_current_limit(
+            member_count=len(complete_payloads),
+            cabinet_count=cabinet_count,
+            array_limit_a=settings.current_limit_a,
+            per_bms_limit_a=settings.charge_current_per_bms_a,
+            per_cabinet_limit_a=settings.current_per_cabinet_a,
+        )
+        discharge_current_limit_a = _effective_current_limit(
+            member_count=len(complete_payloads),
+            cabinet_count=cabinet_count,
+            array_limit_a=settings.current_limit_a,
+            per_bms_limit_a=settings.discharge_current_per_bms_a,
+            per_cabinet_limit_a=settings.current_per_cabinet_a,
+        )
 
     return VirtualBattery(
         identifier=identifier,
@@ -208,12 +244,12 @@ def aggregate_virtual_battery(
         charge_voltage_limit_v=settings.charge_voltage_limit_v if settings is not None else None,
         charge_current_limit_a=(
             0.0 if not charge_enabled or full_charge_cutoff
-            else settings.charge_current_limit_a if settings is not None else None
+            else charge_current_limit_a
         ),
         discharge_voltage_limit_v=settings.discharge_voltage_limit_v if settings is not None else None,
         discharge_current_limit_a=(
             0.0 if not discharge_enabled or empty_discharge_cutoff
-            else settings.discharge_current_limit_a if settings is not None else None
+            else discharge_current_limit_a
         ),
         minimum_cell_voltage_v=min(present(lowest_cell_voltages), default=None),
         maximum_cell_voltage_v=max(present(highest_cell_voltages), default=None),

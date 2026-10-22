@@ -468,8 +468,10 @@ Found 2 BMS devices.
         assert battery_config.virtual_battery_settings is not None
         self.assertEqual(battery_config.virtual_battery_settings.charge_voltage_limit_v, 49.8)
         self.assertEqual(battery_config.virtual_battery_settings.discharge_voltage_limit_v, 40.0)
-        self.assertEqual(battery_config.virtual_battery_settings.charge_current_limit_a, 100)
-        self.assertEqual(battery_config.virtual_battery_settings.discharge_current_limit_a, 100)
+        self.assertEqual(battery_config.virtual_battery_settings.current_limit_a, 250)
+        self.assertEqual(battery_config.virtual_battery_settings.charge_current_per_bms_a, 20)
+        self.assertEqual(battery_config.virtual_battery_settings.discharge_current_per_bms_a, 20)
+        self.assertEqual(battery_config.virtual_battery_settings.current_per_cabinet_a, 100)
         self.assertEqual(battery_config.virtual_battery_settings.state_of_health_percent, 100)
 
     def test_disabled_battery_is_excluded_only_from_virtual_battery(self):
@@ -478,8 +480,7 @@ Found 2 BMS devices.
             "virtual_battery": {
                 "charge_voltage_limit_v": 49.8,
                 "discharge_voltage_limit_v": 40.0,
-                "charge_current_limit_a": 100.0,
-                "discharge_current_limit_a": 100.0,
+                "current_limit_a": 100.0,
                 "state_of_health_percent": 100,
             },
             "batteries": [{

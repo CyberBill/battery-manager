@@ -8,9 +8,24 @@ The manager combines reports from batteries with a valid integer `id`, `cabinet`
 implemented in [virtual_battery.py](virtual_battery.py), displayed on the terminal
 dashboard, and published as the Home Assistant MQTT device `Daly Virtual Battery`.
 
-The `virtual_battery` configuration section defines the $49.8\,V$ charge-voltage
-limit, $40\,V$ discharge-voltage limit, $100\,A$ charge/discharge current limits,
-and $100\%$ state of health sent to the inverter-facing model.
+The `virtual_battery` configuration section defines charge/discharge voltage
+limits, state of health, and three configurable current caps:
+
+- `charge_current_per_bms_a` and `discharge_current_per_bms_a`: per-member
+	current contribution (for example $20\,A$ each direction).
+- `current_per_cabinet_a`: shared per-cabinet maximum for both charge and
+	discharge (for example $100\,A$).
+- `current_limit_a`: shared whole-array maximum for both charge and discharge
+	(for example $250\,A$).
+
+The effective current limit is the minimum of those applicable caps:
+
+$$
+I_\text{effective,dir}=\min\left(I_\text{array},\;N_\text{members}\cdot I_\text{per BMS,dir},\;N_\text{cabinets}\cdot I_\text{per cabinet}\right)
+$$
+
+If per-BMS and per-cabinet fields are omitted, `current_limit_a` behaves as a
+fixed current limit in both directions.
 
 Only batteries excluded from the aggregate need a flag: set
 `"virtual_battery_disabled": true` to exclude that BMS's data from the virtual
@@ -48,5 +63,4 @@ protocol-level inverter responsiveness, rather than merely confirming that bytes
 were written to the USB adapter.
 
 The installed dependency is listed in [requirements.txt](requirements.txt). Frame
-`0x351` advertises the configured static charge/discharge voltage and current
-limits.
+`0x351` advertises the configured voltage limits and the effective current limits.

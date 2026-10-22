@@ -6,8 +6,10 @@ from virtual_battery import UNKNOWN_MQTT_VALUE, VirtualBatterySettings, aggregat
 VIRTUAL_BATTERY_SETTINGS = VirtualBatterySettings(
     charge_voltage_limit_v=49.8,
     discharge_voltage_limit_v=40.0,
-    charge_current_limit_a=100.0,
-    discharge_current_limit_a=100.0,
+    current_limit_a=250.0,
+    charge_current_per_bms_a=20.0,
+    discharge_current_per_bms_a=20.0,
+    current_per_cabinet_a=100.0,
 )
 
 
@@ -72,8 +74,22 @@ class VirtualBatteryTests(unittest.TestCase):
         self.assertTrue(virtual.discharge_enabled)
         self.assertEqual(
             virtual.dashboard_lines()[-1],
-            "  Charge enabled: True (100.0 A)   Discharge enabled: True (100.0 A)",
+            "  Charge enabled: True (40.0 A)   Discharge enabled: True (40.0 A)",
         )
+
+    def test_aggregate_current_is_capped_by_cabinet_limit(self):
+        payloads = []
+        for bms_id in range(1, 13):
+            cabinet = 1 if bms_id <= 6 else 2
+            row = ((bms_id - 1) % 3) + 1
+            depth = 1 if bms_id % 2 else 2
+            payloads.append(bms_payload(id=bms_id, cabinet=cabinet, row=row, depth=depth))
+
+        virtual = aggregate_virtual_battery(payloads, settings=VIRTUAL_BATTERY_SETTINGS)
+
+        self.assertEqual(virtual.member_count, 12)
+        self.assertEqual(virtual.charge_current_limit_a, 200.0)
+        self.assertEqual(virtual.discharge_current_limit_a, 200.0)
 
     def test_aggregate_reports_full_when_any_bms_reports_full(self):
         full = bms_payload(soc={"total_voltage": 48.5, "current": -2.0, "soc_percent": 100.0})
@@ -97,10 +113,10 @@ class VirtualBatteryTests(unittest.TestCase):
         self.assertFalse(virtual.charge_enabled)
         self.assertEqual(virtual.charge_current_limit_a, 0.0)
         self.assertEqual(virtual.state_of_charge_percent, 100.0)
-        self.assertEqual(virtual.discharge_current_limit_a, 100.0)
+        self.assertEqual(virtual.discharge_current_limit_a, 20.0)
         self.assertEqual(
             virtual.dashboard_lines()[-1],
-            "  Charge enabled: full-voltage cutoff (0.0 A)   Discharge enabled: True (100.0 A)",
+            "  Charge enabled: full-voltage cutoff (0.0 A)   Discharge enabled: True (20.0 A)",
         )
 
     def test_aggregate_stops_discharging_and_reports_empty_when_voltage_reaches_limit(self):
@@ -112,10 +128,10 @@ class VirtualBatteryTests(unittest.TestCase):
         self.assertFalse(virtual.discharge_enabled)
         self.assertEqual(virtual.discharge_current_limit_a, 0.0)
         self.assertEqual(virtual.state_of_charge_percent, 0.0)
-        self.assertEqual(virtual.charge_current_limit_a, 100.0)
+        self.assertEqual(virtual.charge_current_limit_a, 20.0)
         self.assertEqual(
             virtual.dashboard_lines()[-1],
-            "  Charge enabled: True (100.0 A)   Discharge enabled: low-voltage cutoff (0.0 A)",
+            "  Charge enabled: True (20.0 A)   Discharge enabled: low-voltage cutoff (0.0 A)",
         )
 
     def test_aggregate_excludes_bms_without_complete_rack_metadata(self):

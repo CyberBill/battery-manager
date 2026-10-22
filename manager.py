@@ -101,6 +101,15 @@ def _require_battery_config_number(entry: dict[str, object], field_name: str) ->
     return float(value)
 
 
+def _optional_battery_config_number(entry: dict[str, object], field_name: str) -> float | None:
+    value = entry.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"virtual_battery.{field_name} must be a number when provided.")
+    return float(value)
+
+
 def _optional_battery_config_boolean(entry: dict[str, object], field_name: str, position: int, *, default: bool) -> bool:
     value = entry.get(field_name, default)
     if not isinstance(value, bool):
@@ -124,8 +133,10 @@ def load_battery_configuration(path: str | Path = DEFAULT_BATTERY_CONFIG_PATH) -
     virtual_battery_settings = VirtualBatterySettings(
         charge_voltage_limit_v=_require_battery_config_number(virtual_battery, "charge_voltage_limit_v"),
         discharge_voltage_limit_v=_require_battery_config_number(virtual_battery, "discharge_voltage_limit_v"),
-        charge_current_limit_a=_require_battery_config_number(virtual_battery, "charge_current_limit_a"),
-        discharge_current_limit_a=_require_battery_config_number(virtual_battery, "discharge_current_limit_a"),
+        current_limit_a=_require_battery_config_number(virtual_battery, "current_limit_a"),
+        charge_current_per_bms_a=_optional_battery_config_number(virtual_battery, "charge_current_per_bms_a"),
+        discharge_current_per_bms_a=_optional_battery_config_number(virtual_battery, "discharge_current_per_bms_a"),
+        current_per_cabinet_a=_optional_battery_config_number(virtual_battery, "current_per_cabinet_a"),
         state_of_health_percent=_require_battery_config_number(virtual_battery, "state_of_health_percent"),
     )
 

@@ -2,8 +2,10 @@
     "virtual_battery": {
         "charge_voltage_limit_v": 49.8,
         "discharge_voltage_limit_v": 40.0,
-        "charge_current_limit_a": 100,
-        "discharge_current_limit_a": 100,
+        "current_limit_a": 250,
+        "charge_current_per_bms_a": 20,
+        "discharge_current_per_bms_a": 20,
+        "current_per_cabinet_a": 100,
         "state_of_health_percent": 100
     },
     "batteries": [
@@ -52,12 +54,16 @@
         {
             "serial": "221KL280200089",
             "id": 7,
-            "virtual_battery_disabled": true
+            "cabinet": 4,
+            "row": 3,
+            "depth": 2
         },
         {
             "serial": "221KL280200317",
             "id": 8,
-            "virtual_battery_disabled": true
+            "cabinet": 4,
+            "row": 3,
+            "depth": 1
         },
         {
             "serial": "221KL280200307",
@@ -118,12 +124,16 @@
         {
             "serial": "221KL280200078",
             "id": 17,
-            "virtual_battery_disabled": true
+            "cabinet": 2,
+            "row": 3,
+            "depth": 2
         },
         {
             "serial": "221KL280200304",
             "id": 18,
-            "virtual_battery_disabled": true
+            "cabinet": 2,
+            "row": 3,
+            "depth": 1
         },
         {
             "serial": "221KL280200091",
@@ -156,16 +166,19 @@
         {
             "serial": "221KL280200320",
             "id": 23,
-            "virtual_battery_disabled": true
+            "cabinet": 1,
+            "row": 3,
+            "depth": 2
         },
         {
             "serial": "221KL280200094",
             "id": 24,
-            "virtual_battery_disabled": true
+            "cabinet": 1,
+            "row": 3,
+            "depth": 1
         },
         {
             "serial": "221KL280200079",
-            "virtual_battery_disabled": true,
             "id": 25,
             "cabinet": 1,
             "row": 2,
@@ -173,7 +186,6 @@
         },
         {
             "serial": "221KL280200303",
-            "virtual_battery_disabled": true,
             "id": 26,
             "cabinet": 1,
             "row": 2,
@@ -182,12 +194,16 @@
         {
             "serial": "221KL280200083",
             "id": 27,
-            "virtual_battery_disabled": true
+            "cabinet": 1,
+            "row": 1,
+            "depth": 2
         },
         {
             "serial": "221KL280200077",
             "id": 28,
-            "virtual_battery_disabled": true
+            "cabinet": 1,
+            "row": 1,
+            "depth": 1
         }
     ]
 }
