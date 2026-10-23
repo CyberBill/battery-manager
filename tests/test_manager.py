@@ -11,6 +11,7 @@ from manager import (
     PortMonitor,
     PortRegistry,
     BatteryConfiguration,
+    BatteryMetadata,
     SafetyConfiguration,
     bind_dashboard_monitor_updates,
     bitmask_to_ids,
@@ -39,7 +40,7 @@ class ManagerTests(unittest.TestCase):
 
     @staticmethod
     def safety_config() -> SafetyConfiguration:
-        return SafetyConfiguration(35, 0.5, 39, 51, 3.1, 4.18)
+        return SafetyConfiguration(35, 5, 7, 0.5, 39, 51, 3.1, 4.18)
 
     def test_filter_serial_ports_keeps_raspberry_serial_candidates(self):
         raw_ports = [
@@ -427,6 +428,44 @@ Found 2 BMS devices.
 
         self.assertEqual(sync_soc.call_count, 2)
 
+    def test_temperature_delta_violation_is_republished_as_unsafe(self):
+        battery_config = BatteryConfiguration(batteries_by_serial={
+            "S1": BatteryMetadata("S1", 1, cabinet=1, row=1, depth=1),
+            "S2": BatteryMetadata("S2", 2, cabinet=1, row=1, depth=2),
+        })
+        registry = PortRegistry(battery_config=battery_config, safety_config=self.safety_config())
+
+        def payload(bms_id, low, high):
+            return {
+                "id": bms_id, "cabinet": 1, "row": 1, "depth": bms_id, "safe": True, "safety_reason": "OK",
+                "soc": {}, "cell_voltage_range": {},
+                "temperature_range": {"lowest_temperature": low, "highest_temperature": high},
+            }
+
+        registry.record_bms_payload("/dev/ttyUSB0:1", payload(1, 20, 21))
+        registry.record_bms_payload("/dev/ttyUSB0:2", payload(2, 21, 28.5))
+
+        fake_client = MagicMock()
+        fake_paho = types.ModuleType("paho")
+        fake_paho_mqtt = types.ModuleType("paho.mqtt")
+        fake_paho_client = types.ModuleType("paho.mqtt.client")
+        setattr(fake_paho_client, "Client", MagicMock(return_value=fake_client))
+        setattr(fake_paho, "mqtt", fake_paho_mqtt)
+        setattr(fake_paho_mqtt, "client", fake_paho_client)
+        mqtt_config = {"enabled": True, "broker": "broker", "user": "u", "password": "p", "port": 1883}
+
+        with patch("manager.mqtt_iterator") as mqtt_iterator_mock, patch.dict(
+            sys.modules, {"paho": fake_paho, "paho.mqtt": fake_paho_mqtt, "paho.mqtt.client": fake_paho_client}
+        ):
+            registry.publish_temperature_delta_violations(mqtt_config)
+
+        self.assertEqual(mqtt_iterator_mock.call_count, 1)
+        published = mqtt_iterator_mock.call_args.args[0]
+        self.assertEqual(published["id"], 2)
+        self.assertFalse(published["safe"])
+        self.assertIn("above the array minimum", published["safety_reason"])
+        self.assertEqual(mqtt_iterator_mock.call_args.kwargs["serial_number"], "S2")
+
     def test_empty_discharge_cutoff_triggers_soc_sync_once(self):
         registry = PortRegistry(battery_config=self.battery_config())
         cutoff_battery = MagicMock(full_charge_cutoff=False, empty_discharge_cutoff=True)
@@ -555,8 +594,9 @@ Found 2 BMS devices.
                 "safety_reason": "OK",
             },
         )
+        unset_location_config = BatteryConfiguration({"unset-location": BatteryMetadata("unset-location", 7)})
         self.assertEqual(
-            build_bms_management_payload(battery_config, "221KL280200089", (True, "OK")),
+            build_bms_management_payload(unset_location_config, "unset-location", (True, "OK")),
             {
                 "id": 7,
                 "cabinet": "None",
@@ -654,20 +694,39 @@ Found 2 BMS devices.
     def test_load_safety_configuration_and_evaluate_bms_safety(self):
         safety_config = load_safety_configuration(Path(__file__).parent.parent / "safety-config.json")
         payload = {
-            "temperature_range": {"highest_temperature": 36},
+            "temperature_range": {"highest_temperature": 36, "lowest_temperature": 20},
             "cell_voltage_range": {"highest_voltage": 3.9, "lowest_voltage": 3.6},
             "soc": {"total_voltage": 48},
         }
 
         self.assertEqual(safety_config.max_temperature_c, 35)
+        self.assertEqual(safety_config.min_temperature_c, 5)
+        self.assertEqual(safety_config.max_temperature_delta_c, 7)
         self.assertEqual(
             evaluate_bms_safety(payload, safety_config),
             (False, "Battery temperature is 36 C (limit 35 C)"),
         )
 
+    def test_evaluate_bms_safety_rejects_low_or_missing_lowest_temperature(self):
+        payload = {
+            "temperature_range": {"highest_temperature": 20, "lowest_temperature": 4},
+            "cell_voltage_range": {"highest_voltage": 3.9, "lowest_voltage": 3.6},
+            "soc": {"total_voltage": 48},
+        }
+        self.assertEqual(
+            evaluate_bms_safety(payload, self.safety_config()),
+            (False, "Battery temperature is 4 C (minimum 5 C)"),
+        )
+
+        payload["temperature_range"] = {"highest_temperature": 20}
+        self.assertEqual(
+            evaluate_bms_safety(payload, self.safety_config()),
+            (False, "Missing lowest battery temperature"),
+        )
+
     def test_evaluate_bms_safety_checks_highest_cell_voltage(self):
         payload = {
-            "temperature_range": {"highest_temperature": 30},
+            "temperature_range": {"highest_temperature": 30, "lowest_temperature": 20},
             "cell_voltage_range": {"highest_voltage": 4.19, "lowest_voltage": 3.8},
             "soc": {"total_voltage": 48},
         }
@@ -679,7 +738,7 @@ Found 2 BMS devices.
 
     def test_evaluate_bms_safety_checks_lowest_cell_voltage(self):
         payload = {
-            "temperature_range": {"highest_temperature": 30},
+            "temperature_range": {"highest_temperature": 30, "lowest_temperature": 20},
             "cell_voltage_range": {"highest_voltage": 3.5, "lowest_voltage": 3.09},
             "soc": {"total_voltage": 48},
         }

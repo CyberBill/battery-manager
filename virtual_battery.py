@@ -121,6 +121,31 @@ def _sum(values: Iterable[float]) -> float | None:
     return sum(values) if values else None
 
 
+def _is_complete(payload: dict[str, Any]) -> bool:
+    return _valid_member(payload) and all(
+        isinstance(payload.get(section), dict) for section in ("soc", "cell_voltage_range", "temperature_range")
+    )
+
+
+def temperature_delta_violations(payloads: Iterable[dict[str, Any]], limit_c: float | None) -> list[tuple[dict[str, Any], str]]:
+    """Return (payload, reason) for each complete BMS whose max temperature exceeds the array minimum by more than limit_c."""
+    complete = [payload for payload in payloads if _is_complete(payload)]
+    lows = [value for p in complete if (value := _section_number(p, "temperature_range", "lowest_temperature")) is not None]
+    if limit_c is None or not lows:
+        return []
+    array_minimum = min(lows)
+    violations = []
+    for payload in complete:
+        high = _section_number(payload, "temperature_range", "highest_temperature")
+        if high is not None and high - array_minimum > limit_c:
+            violations.append((
+                payload,
+                f"BMS {payload.get('id')} is {high - array_minimum:.1f} C above the array minimum "
+                f"(max {high:g} C vs min {array_minimum:g} C, limit {limit_c:g} C)",
+            ))
+    return violations
+
+
 def _effective_current_limit(
     *,
     member_count: int,
@@ -142,6 +167,7 @@ def aggregate_virtual_battery(
     *,
     identifier: str = "Daly Virtual Battery",
     settings: VirtualBatterySettings | None = None,
+    max_temperature_delta_c: float | None = None,
 ) -> VirtualBattery:
     """Combine BMS reports having complete rack-location metadata.
 
@@ -153,12 +179,7 @@ def aggregate_virtual_battery(
     configuration.
     """
     configured_payloads = [payload for payload in payloads if _valid_member(payload)]
-    complete_payloads = [
-        payload for payload in configured_payloads
-        if isinstance(payload.get("soc"), dict)
-        and isinstance(payload.get("cell_voltage_range"), dict)
-        and isinstance(payload.get("temperature_range"), dict)
-    ]
+    complete_payloads = [payload for payload in configured_payloads if _is_complete(payload)]
 
     pack_voltages = [_section_number(payload, "soc", "total_voltage") for payload in complete_payloads]
     pack_currents = [_section_number(payload, "soc", "current") for payload in complete_payloads]
@@ -174,8 +195,14 @@ def aggregate_virtual_battery(
     def present(values: Iterable[float | None]) -> list[float]:
         return [value for value in values if value is not None]
 
-    complete_safe = bool(complete_payloads) and all(payload.get("safe") is True for payload in complete_payloads)
+    delta_reasons = [reason for _, reason in temperature_delta_violations(complete_payloads, max_temperature_delta_c)]
+    complete_safe = (
+        bool(complete_payloads)
+        and all(payload.get("safe") is True for payload in complete_payloads)
+        and not delta_reasons
+    )
     unsafe_reasons = [str(payload.get("safety_reason")) for payload in complete_payloads if payload.get("safe") is not True]
+    unsafe_reasons.extend(delta_reasons)
     safety_reason = "OK" if complete_safe else (unsafe_reasons[0] if unsafe_reasons else "No complete configured BMS reports")
 
     charging_mosfets = [

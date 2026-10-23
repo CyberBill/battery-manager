@@ -134,6 +134,19 @@ class VirtualBatteryTests(unittest.TestCase):
             "  Charge enabled: True (20.0 A)   Discharge enabled: low-voltage cutoff (0.0 A)",
         )
 
+    def test_aggregate_trips_when_bms_max_temperature_exceeds_array_minimum_by_delta_limit(self):
+        cool = bms_payload(temperature_range={"lowest_temperature": 20.0, "highest_temperature": 22.0})
+        warm = bms_payload(id=2, depth=2, temperature_range={"lowest_temperature": 21.0, "highest_temperature": 27.5})
+
+        within = aggregate_virtual_battery([cool, warm], settings=VIRTUAL_BATTERY_SETTINGS, max_temperature_delta_c=7.5)
+        tripped = aggregate_virtual_battery([cool, warm], settings=VIRTUAL_BATTERY_SETTINGS, max_temperature_delta_c=7.0)
+
+        self.assertTrue(within.safe)
+        self.assertFalse(tripped.safe)
+        self.assertIn("BMS 2 is 7.5 C above the array minimum", tripped.safety_reason)
+        self.assertEqual(tripped.charge_current_limit_a, 0.0)
+        self.assertEqual(tripped.discharge_current_limit_a, 0.0)
+
     def test_aggregate_excludes_bms_without_complete_rack_metadata(self):
         unconfigured = bms_payload(id="None", cabinet="None", row="None", depth="None")
 

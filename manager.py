@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from luxpower_can import LuxPowerCanPublisher
-from virtual_battery import VirtualBattery, VirtualBatterySettings, aggregate_virtual_battery
+from virtual_battery import VirtualBattery, VirtualBatterySettings, aggregate_virtual_battery, temperature_delta_violations
 
 try:
     import serial.tools.list_ports as list_ports
@@ -77,6 +77,8 @@ class SafetyConfiguration:
     """Per-BMS limits used to decide whether a report is safe."""
 
     max_temperature_c: float
+    min_temperature_c: float
+    max_temperature_delta_c: float
     max_cell_voltage_spread_v: float
     min_pack_voltage_v: float
     max_pack_voltage_v: float
@@ -194,6 +196,8 @@ def load_safety_configuration(path: str | Path = DEFAULT_SAFETY_CONFIG_PATH) -> 
 
     return SafetyConfiguration(
         max_temperature_c=_require_config_number(raw_config, "max_temperature_c"),
+        min_temperature_c=_require_config_number(raw_config, "min_temperature_c"),
+        max_temperature_delta_c=_require_config_number(raw_config, "max_temperature_delta_c"),
         max_cell_voltage_spread_v=_require_config_number(raw_config, "max_cell_voltage_spread_v"),
         min_pack_voltage_v=_require_config_number(raw_config, "min_pack_voltage_v"),
         max_pack_voltage_v=_require_config_number(raw_config, "max_pack_voltage_v"),
@@ -464,6 +468,11 @@ def evaluate_bms_safety(payload: dict[str, Any], safety_config: SafetyConfigurat
         return False, "Missing highest battery temperature"
     if temperature > safety_config.max_temperature_c:
         return False, f"Battery temperature is {temperature:g} C (limit {safety_config.max_temperature_c:g} C)"
+    lowest_temperature = _payload_number(payload, "temperature_range", "lowest_temperature")
+    if lowest_temperature is None:
+        return False, "Missing lowest battery temperature"
+    if lowest_temperature < safety_config.min_temperature_c:
+        return False, f"Battery temperature is {lowest_temperature:g} C (minimum {safety_config.min_temperature_c:g} C)"
 
     highest_voltage = _payload_number(payload, "cell_voltage_range", "highest_voltage")
     lowest_voltage = _payload_number(payload, "cell_voltage_range", "lowest_voltage")
@@ -983,7 +992,49 @@ class PortRegistry:
             return aggregate_virtual_battery(
                 self.bms_payloads.values(),
                 settings=self.battery_config.virtual_battery_settings,
+                max_temperature_delta_c=(
+                    self.safety_config.max_temperature_delta_c if self.safety_config is not None else None
+                ),
             )
+
+    def publish_temperature_delta_violations(self, mqtt_config: dict[str, object] | None) -> None:
+        """Republish BMSs tripped by the array temperature-delta limit as unsafe; they were first published as safe."""
+        if not mqtt_config or not bool(mqtt_config.get("enabled", True)) or self.safety_config is None:
+            return
+        with self._payload_lock:
+            payloads = list(self.bms_payloads.values())
+        violations = temperature_delta_violations(payloads, self.safety_config.max_temperature_delta_c)
+        if not violations:
+            return
+
+        try:
+            import paho.mqtt.client as paho
+        except ImportError as exc:  # pragma: no cover - environment-specific dependency.
+            raise RuntimeError("The paho-mqtt Python package is required for MQTT publishing.") from exc
+
+        for payload, reason in violations:
+            battery = self.battery_config.find_battery_by_id(payload["id"])
+            if battery is None:
+                continue
+            device_id, device_name, topic_root = build_mqtt_device_identity(battery.serial)
+            mqtt_client = paho.Client()
+            mqtt_client.username_pw_set(str(mqtt_config.get("user")), str(mqtt_config.get("password")))
+            mqtt_client.connect(str(mqtt_config.get("broker")), port=int(mqtt_config.get("port", 1883)))
+            mqtt_client.loop_start()
+            try:
+                mqtt_iterator(
+                    {**payload, "safe": False, "safety_reason": reason},
+                    mqtt_client=mqtt_client,
+                    logger=self.logger,
+                    topic_root=topic_root,
+                    device_id=device_id,
+                    device_name=device_name,
+                    serial_number=battery.serial,
+                    mqtt_hass=False,
+                )
+            finally:
+                mqtt_client.disconnect()
+                mqtt_client.loop_stop()
 
     def publish_configured_bms_metadata(self, mqtt_config: dict[str, object] | None = None) -> None:
         """Publish each configured battery's metadata once at startup.
@@ -1204,6 +1255,10 @@ def _make_mqtt_update_callback(
             can_publisher.update(virtual_battery)
         if not mqtt_ready or mqtt_cfg_for_call is None:
             return
+        try:
+            registry.publish_temperature_delta_violations(mqtt_cfg_for_call)
+        except Exception as exc:  # pragma: no cover - broker-dependent path.
+            registry.logger.error("Failed to publish temperature-delta violations: %s", exc)
         try:
             publish_virtual_battery_via_library(
                 virtual_battery,
