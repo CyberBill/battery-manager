@@ -6,6 +6,21 @@
         "charge_current_per_bms_a": 20,
         "discharge_current_per_bms_a": 20,
         "current_per_cabinet_a": 100,
+        "cell_voltage_derating": {
+            "charge": {
+                "start_v": 3.95,
+                "end_v": 4.15,
+                "min_current_a": 1
+            },
+            "discharge": {
+                "start_v": 3.5,
+                "end_v": 3.3,
+                "min_current_a": 1
+            },
+            "curve_end_factor": 2.0,
+            "curve_shape": 1.8,
+            "recovery_seconds": 300
+        },
         "state_of_health_percent": 100
     },
     "batteries": [

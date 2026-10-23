@@ -19,7 +19,15 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from luxpower_can import LuxPowerCanPublisher
-from virtual_battery import VirtualBattery, VirtualBatterySettings, aggregate_virtual_battery, temperature_delta_violations
+from virtual_battery import (
+    CellVoltageDerater,
+    CellVoltageDeratingSettings,
+    DeratingCurve,
+    VirtualBattery,
+    VirtualBatterySettings,
+    aggregate_virtual_battery,
+    temperature_delta_violations,
+)
 
 try:
     import serial.tools.list_ports as list_ports
@@ -119,6 +127,47 @@ def _optional_battery_config_boolean(entry: dict[str, object], field_name: str, 
     return value
 
 
+def _load_cell_voltage_derating(raw: object) -> CellVoltageDeratingSettings | None:
+    if raw is None:
+        return None
+    prefix = "virtual_battery.cell_voltage_derating"
+    if not isinstance(raw, dict):
+        raise ValueError(f"{prefix} must be an object.")
+
+    def number(entry: dict[str, object], path: str, name: str, default: float | None = None) -> float:
+        value = entry.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{path}.{name} must be a number.")
+        return float(value)
+
+    def curve(direction: str) -> DeratingCurve:
+        entry = raw.get(direction)
+        path = f"{prefix}.{direction}"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path} must be an object.")
+        result = DeratingCurve(
+            start_v=number(entry, path, "start_v"),
+            end_v=number(entry, path, "end_v"),
+            min_current_a=number(entry, path, "min_current_a", 1.0),
+        )
+        if (result.start_v >= result.end_v) if direction == "charge" else (result.start_v <= result.end_v):
+            raise ValueError(f"{path}.start_v must be {'below' if direction == 'charge' else 'above'} end_v.")
+        if result.min_current_a < 0:
+            raise ValueError(f"{path}.min_current_a must not be negative.")
+        return result
+
+    settings = CellVoltageDeratingSettings(
+        charge=curve("charge"),
+        discharge=curve("discharge"),
+        curve_end_factor=number(raw, prefix, "curve_end_factor", 2.0),
+        curve_shape=number(raw, prefix, "curve_shape", 1.8),
+        recovery_seconds=number(raw, prefix, "recovery_seconds", 300.0),
+    )
+    if settings.recovery_seconds <= 0:
+        raise ValueError(f"{prefix}.recovery_seconds must be greater than zero.")
+    return settings
+
+
 def load_battery_configuration(path: str | Path = DEFAULT_BATTERY_CONFIG_PATH) -> BatteryConfiguration:
     """Load BMS metadata from the JSON configuration file used for MQTT publishing."""
     config_path = Path(path)
@@ -140,6 +189,7 @@ def load_battery_configuration(path: str | Path = DEFAULT_BATTERY_CONFIG_PATH) -
         discharge_current_per_bms_a=_optional_battery_config_number(virtual_battery, "discharge_current_per_bms_a"),
         current_per_cabinet_a=_optional_battery_config_number(virtual_battery, "current_per_cabinet_a"),
         state_of_health_percent=_require_battery_config_number(virtual_battery, "state_of_health_percent"),
+        cell_voltage_derating=_load_cell_voltage_derating(virtual_battery.get("cell_voltage_derating")),
     )
 
     batteries_by_serial: dict[str, BatteryMetadata] = {}
@@ -967,6 +1017,11 @@ class PortRegistry:
         self._can_publisher: LuxPowerCanPublisher | None = None
         self._full_charge_cutoff_active = False
         self._empty_discharge_cutoff_active = False
+        derating = (
+            self.battery_config.virtual_battery_settings.cell_voltage_derating
+            if self.battery_config.virtual_battery_settings is not None else None
+        )
+        self._cell_derater = CellVoltageDerater(derating) if derating is not None else None
         self.excluded_ports = tuple(excluded_ports or ())
         self.excluded_port_ids = tuple(excluded_port_ids or ())
         self.excluded_patterns = tuple(excluded_patterns or DEFAULT_EXCLUDED_PORT_PATTERNS)
@@ -989,13 +1044,16 @@ class PortRegistry:
     def virtual_battery(self) -> VirtualBattery:
         """Return the current aggregate of BMS reports with full rack metadata."""
         with self._payload_lock:
-            return aggregate_virtual_battery(
+            battery = aggregate_virtual_battery(
                 self.bms_payloads.values(),
                 settings=self.battery_config.virtual_battery_settings,
                 max_temperature_delta_c=(
                     self.safety_config.max_temperature_delta_c if self.safety_config is not None else None
                 ),
             )
+            if self._cell_derater is not None:
+                battery = self._cell_derater.apply(battery, time.monotonic())
+            return battery
 
     def publish_temperature_delta_violations(self, mqtt_config: dict[str, object] | None) -> None:
         """Republish BMSs tripped by the array temperature-delta limit as unsafe; they were first published as safe."""

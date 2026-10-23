@@ -27,6 +27,13 @@ $$
 If per-BMS and per-cabinet fields are omitted, `current_limit_a` behaves as a
 fixed current limit in both directions.
 
+The optional `cell_voltage_derating` block (modelled on YamBMS Auto CCL/DCL) tapers
+the effective limit from the worst cell in the array. Charge uses the highest cell
+voltage and discharge uses the lowest. Current is full at `start_v`, follows a
+curve down to `min_current_a` at `end_v`, and drops to $0\,A$ once a cell passes
+`end_v`. Drops apply instantly; recovery is linear over `recovery_seconds`
+(full range). `curve_end_factor` and `curve_shape` tune the curve.
+
 Only batteries excluded from the aggregate need a flag: set
 `"virtual_battery_disabled": true` to exclude that BMS's data from the virtual
 battery. This is useful for an installed but electrically disconnected battery

@@ -6,12 +6,32 @@ separate LuxPower CAN transport.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from math import floor
 from statistics import fmean
 from typing import Any, Iterable
 
 UNKNOWN_MQTT_VALUE = "None"
+
+
+@dataclass(frozen=True)
+class DeratingCurve:
+    """Per-cell voltage span over which current tapers; start_v is full current, end_v is the floor."""
+
+    start_v: float
+    end_v: float
+    min_current_a: float = 1.0
+
+
+@dataclass(frozen=True)
+class CellVoltageDeratingSettings:
+    """Per-cell current derating near the charge and discharge voltage limits (YamBMS Auto CCL/DCL style)."""
+
+    charge: DeratingCurve
+    discharge: DeratingCurve
+    curve_end_factor: float = 2.0
+    curve_shape: float = 1.8
+    recovery_seconds: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -25,6 +45,7 @@ class VirtualBatterySettings:
     discharge_current_per_bms_a: float | None = None
     current_per_cabinet_a: float | None = None
     state_of_health_percent: float = 100.0
+    cell_voltage_derating: CellVoltageDeratingSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +165,60 @@ def temperature_delta_violations(payloads: Iterable[dict[str, Any]], limit_c: fl
                 f"(max {high:g} C vs min {array_minimum:g} C, limit {limit_c:g} C)",
             ))
     return violations
+
+
+def derating_fraction(voltage_v: float, curve: DeratingCurve, curve_end_factor: float, curve_shape: float) -> float:
+    """Return the allowed fraction (0..1) of current at a cell voltage; works for rising and falling spans."""
+    ratio = (voltage_v - curve.start_v) / (curve.end_v - curve.start_v)
+    if ratio <= 0:
+        return 1.0
+    return min(1.0, max(0.0, 2.0 - curve_end_factor ** (min(ratio, 1.0) ** curve_shape)))
+
+
+class CellVoltageDerater:
+    """Derate virtual-battery current limits from the worst cell; drops instantly and recovers linearly."""
+
+    def __init__(self, settings: CellVoltageDeratingSettings) -> None:
+        self.settings = settings
+        self._fractions: dict[str, float] = {}
+        self._updated_at: dict[str, float] = {}
+
+    def apply(self, battery: VirtualBattery, now: float) -> VirtualBattery:
+        return replace(
+            battery,
+            charge_current_limit_a=self._limit(
+                "charge", battery.charge_current_limit_a, battery.maximum_cell_voltage_v, self.settings.charge, now,
+            ),
+            discharge_current_limit_a=self._limit(
+                "discharge", battery.discharge_current_limit_a, battery.minimum_cell_voltage_v, self.settings.discharge, now,
+            ),
+        )
+
+    def _limit(
+        self,
+        direction: str,
+        limit_a: float | None,
+        cell_voltage_v: float | None,
+        curve: DeratingCurve,
+        now: float,
+    ) -> float | None:
+        if limit_a is None or cell_voltage_v is None:
+            return limit_a
+        past_end = cell_voltage_v > curve.end_v if curve.end_v > curve.start_v else cell_voltage_v < curve.end_v
+        target = 0.0 if past_end else derating_fraction(
+            cell_voltage_v, curve, self.settings.curve_end_factor, self.settings.curve_shape,
+        )
+        previous = self._fractions.get(direction)
+        if previous is None or target < previous:
+            fraction = target
+        else:
+            elapsed = max(0.0, now - self._updated_at[direction])
+            fraction = min(target, previous + elapsed / self.settings.recovery_seconds)
+        self._fractions[direction] = fraction
+        self._updated_at[direction] = now
+        if limit_a <= 0 or past_end:
+            return 0.0
+        return min(limit_a, max(curve.min_current_a, limit_a * fraction))
 
 
 def _effective_current_limit(

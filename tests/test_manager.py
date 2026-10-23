@@ -512,6 +512,31 @@ Found 2 BMS devices.
         self.assertEqual(battery_config.virtual_battery_settings.discharge_current_per_bms_a, 20)
         self.assertEqual(battery_config.virtual_battery_settings.current_per_cabinet_a, 100)
         self.assertEqual(battery_config.virtual_battery_settings.state_of_health_percent, 100)
+        derating = battery_config.virtual_battery_settings.cell_voltage_derating
+        assert derating is not None
+        self.assertEqual((derating.charge.start_v, derating.charge.end_v, derating.charge.min_current_a), (3.95, 4.15, 1))
+        self.assertEqual((derating.discharge.start_v, derating.discharge.end_v), (3.5, 3.3))
+        self.assertEqual(derating.recovery_seconds, 300)
+
+    def test_cell_voltage_derating_rejects_reversed_voltage_span(self):
+        config_path = Path(self.id()).with_suffix(".json")
+        config_path.write_text(json.dumps({
+            "virtual_battery": {
+                "charge_voltage_limit_v": 49.8,
+                "discharge_voltage_limit_v": 40.0,
+                "current_limit_a": 100.0,
+                "state_of_health_percent": 100,
+                "cell_voltage_derating": {
+                    "charge": {"start_v": 4.15, "end_v": 4.05},
+                    "discharge": {"start_v": 3.5, "end_v": 3.3},
+                },
+            },
+            "batteries": [],
+        }), encoding="utf-8")
+        self.addCleanup(config_path.unlink)
+
+        with self.assertRaisesRegex(ValueError, "charge.start_v must be below end_v"):
+            load_battery_configuration(config_path)
 
     def test_disabled_battery_is_excluded_only_from_virtual_battery(self):
         config_path = Path(self.id()).with_suffix(".json")

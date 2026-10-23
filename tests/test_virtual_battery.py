@@ -1,6 +1,20 @@
 import unittest
 
-from virtual_battery import UNKNOWN_MQTT_VALUE, VirtualBatterySettings, aggregate_virtual_battery
+from virtual_battery import (
+    UNKNOWN_MQTT_VALUE,
+    CellVoltageDerater,
+    CellVoltageDeratingSettings,
+    DeratingCurve,
+    VirtualBatterySettings,
+    aggregate_virtual_battery,
+    derating_fraction,
+)
+
+DERATING = CellVoltageDeratingSettings(
+    charge=DeratingCurve(4.05, 4.15, 1.0),
+    discharge=DeratingCurve(3.5, 3.3, 1.0),
+    recovery_seconds=300.0,
+)
 
 
 VIRTUAL_BATTERY_SETTINGS = VirtualBatterySettings(
@@ -33,6 +47,52 @@ def bms_payload(**overrides):
 
 
 class VirtualBatteryTests(unittest.TestCase):
+    @staticmethod
+    def single_bms(lowest_v=3.6, highest_v=3.9):
+        payload = bms_payload(cell_voltage_range={"lowest_voltage": lowest_v, "highest_voltage": highest_v})
+        return aggregate_virtual_battery([payload], settings=VIRTUAL_BATTERY_SETTINGS)
+
+    def test_derating_fraction_spans_full_current_to_zero_for_both_directions(self):
+        self.assertEqual(derating_fraction(4.0, DERATING.charge, 2.0, 1.8), 1.0)
+        self.assertEqual(derating_fraction(4.05, DERATING.charge, 2.0, 1.8), 1.0)
+        self.assertAlmostEqual(derating_fraction(4.10, DERATING.charge, 2.0, 1.8), 0.78, places=2)
+        self.assertEqual(derating_fraction(4.15, DERATING.charge, 2.0, 1.8), 0.0)
+        self.assertEqual(derating_fraction(3.6, DERATING.discharge, 2.0, 1.8), 1.0)
+        self.assertAlmostEqual(derating_fraction(3.4, DERATING.discharge, 2.0, 1.8), 0.78, places=2)
+        self.assertEqual(derating_fraction(3.3, DERATING.discharge, 2.0, 1.8), 0.0)
+
+    def test_derater_holds_minimum_current_until_cell_passes_end_voltage(self):
+        derater = CellVoltageDerater(DERATING)
+
+        at_end = derater.apply(self.single_bms(highest_v=4.15, lowest_v=3.3), now=0.0)
+        past_end = derater.apply(self.single_bms(highest_v=4.16, lowest_v=3.29), now=1.0)
+
+        self.assertEqual(at_end.charge_current_limit_a, 1.0)
+        self.assertEqual(at_end.discharge_current_limit_a, 1.0)
+        self.assertEqual(past_end.charge_current_limit_a, 0.0)
+        self.assertEqual(past_end.discharge_current_limit_a, 0.0)
+
+    def test_derater_drops_instantly_and_recovers_linearly(self):
+        derater = CellVoltageDerater(DERATING)
+
+        normal = derater.apply(self.single_bms(highest_v=4.0), now=0.0)
+        dropped = derater.apply(self.single_bms(highest_v=4.15), now=10.0)
+        halfway = derater.apply(self.single_bms(highest_v=4.0), now=160.0)
+        recovered = derater.apply(self.single_bms(highest_v=4.0), now=310.0)
+
+        self.assertEqual(normal.charge_current_limit_a, 20.0)
+        self.assertEqual(dropped.charge_current_limit_a, 1.0)
+        self.assertAlmostEqual(halfway.charge_current_limit_a or 0.0, 10.0)
+        self.assertEqual(recovered.charge_current_limit_a, 20.0)
+
+    def test_derater_never_raises_an_already_zero_limit(self):
+        unsafe = aggregate_virtual_battery([bms_payload(safe=False)], settings=VIRTUAL_BATTERY_SETTINGS)
+
+        derated = CellVoltageDerater(DERATING).apply(unsafe, now=0.0)
+
+        self.assertEqual(derated.charge_current_limit_a, 0.0)
+        self.assertEqual(derated.discharge_current_limit_a, 0.0)
+
     def test_aggregate_combines_parallel_bms_reports(self):
         second = bms_payload(
             id=2,
